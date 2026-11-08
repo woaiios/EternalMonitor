@@ -2,6 +2,12 @@
 
 更新：2026-11-08，Windows 工作目录 `D:\lab\EternalMonitor`。
 
+## 原生显示基线补测（2026-11-08）
+
+用户追问原生 iOS 是否真的需要约 15ms 后，新增独立 UIKit + Metal 基准，真机数据见 [NATIVE_PRESENT_BENCHMARK.md](NATIVE_PRESENT_BENCHMARK.md)。确认原生立即提交也能在约 120fps 时测到 GPU完成→呈现 p50 15.64ms；CAMetalDisplayLink 晚提交的保守档降到 9.20ms / p95 9.94ms，激进档 7.85ms / p95 8.01ms 但有 3.86% 未呈现帧。刷新间隔 8.3367ms 与单帧等待不能混为一谈。
+
+本次只增加基准，没有把未充分验证的晚提交参数改进串流默认值。基准为了复用免费签名槽会临时替换预览可执行程序；测试后应恢复 build/pyrowave/native-bench-restore.app，原容器不卸载，WDA 保持关闭。构建/安装/恢复日志留本地。下一步可据这一结果针对串流的 deadline 调度和 drawable 阻塞做定向修复，必须同时统计实际呈现帧率和 presentedTime=0。
+
 ## 最新延迟优化检查点（2026-11-08 16:55 JST）
 
 本节覆盖下面初次接通记录中的旧状态。用户随后要求以当前游戏场景、全屏 iPad 为基准，尽力将完整链路压到 10ms；最新指令为先 commit，暂停继续调参。

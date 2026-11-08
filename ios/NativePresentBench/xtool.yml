@@ -1,0 +1,6 @@
+version: 1
+# Reuse the preview's provisioned app slot, then reinstall the streaming app.
+# Installation preserves its container; never uninstall the user's preview.
+bundleID: dev.eternalmonitor.PyroWavePreview
+infoPath: Info.plist
+skipLSP: true

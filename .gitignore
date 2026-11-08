@@ -33,6 +33,10 @@ ios/PyroWaveBench/.build/
 ios/PyroWaveBench/.swiftpm/
 ios/PyroWaveBench/.bsp/
 ios/PyroWaveBench/xtool/
+ios/NativePresentBench/.build/
+ios/NativePresentBench/.swiftpm/
+ios/NativePresentBench/.bsp/
+ios/NativePresentBench/xtool/
 
 # Generated Xcode project — project.yml is the source of truth (run `xcodegen generate` in ios/)
 ios/EternalMonitor.xcodeproj/
