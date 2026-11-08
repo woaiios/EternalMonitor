@@ -119,6 +119,8 @@ fn quitting_does_not_wait_for_slow_uploads_and_keeps_the_rest() {
     let _ = std::fs::remove_dir_all(&dir);
     let app_dir = dir.join("EternalMonitor");
     let outbox = app_dir.join("diagnostics-outbox");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(app_dir.join("diagnostics-upload-enabled"), "enabled").unwrap();
     seed_outbox(&outbox);
     let (endpoint, requests) = slow_server();
     std::fs::write(

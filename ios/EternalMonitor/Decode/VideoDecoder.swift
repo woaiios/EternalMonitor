@@ -55,6 +55,7 @@ final class VideoDecoder {
 
     private var formatDescription: CMVideoFormatDescription?
     private var decompressionSession: VTDecompressionSession?
+    private var pyrowaveDecoder: PyroWaveVideoDecoder?
     private var codec: StreamCodec = .h264
     private var vps: Data?
     private var sps: Data?
@@ -251,6 +252,7 @@ final class VideoDecoder {
     func shutdown(completion: (() -> Void)? = nil) {
         decodeQueue.async {
             self.isShutdown = true
+            self.pyrowaveDecoder = nil
             self.recoveryTimer?.cancel()
             self.teardownSession(waitForFrames: true)
             self.formatDescription = nil
@@ -285,6 +287,38 @@ final class VideoDecoder {
 
     private func decodeOnQueue(packet: FramePacket) {
         guard !isShutdown else { return }
+        if PyroWaveVideoDecoder.recognizes(packet.data) {
+            // Every frame is independent: discard a queued old picture
+            // rather than letting a slow receiver accumulate latency.
+            guard queued.withLock({ $0 }) == 0 else { return }
+            if pyrowaveDecoder == nil {
+                teardownSession(waitForFrames: true)
+                formatDescription = nil
+                pyrowaveDecoder = PyroWaveVideoDecoder()
+                onEvent?("PyroWave Metal decoder active")
+            }
+            inFlight.withLock { $0 += 1 }
+            defer { inFlight.withLock { $0 -= 1 } }
+            do {
+                let pixel = try pyrowaveDecoder!.decode(packet.data)
+                let sequence = Self.submissions.withLock { last in last &+= 1; return last }
+                waitingForSyncSample = false
+                hold.withLock { $0 = nil }
+                onFrameDecoded?(pixel, packet.timestampUs, sequence)
+            } catch {
+                reportFailure("PyroWave decode failed: \(error)")
+                beginWaitingForKeyframe()
+                requestKeyframeIfOverdue()
+            }
+            return
+        }
+        if pyrowaveDecoder != nil {
+            pyrowaveDecoder = nil
+            waitingForSyncSample = true
+            formatDescription = nil
+            vps = nil; sps = nil; pps = nil
+            continuity = ReferenceContinuity()
+        }
         if verboseDecodeLogging && !hasLoggedFirstPacketHex {
             hasLoggedFirstPacketHex = true
             let hex = packet.data.prefix(16).map { String(format: "%02X", $0) }.joined(separator: " ")

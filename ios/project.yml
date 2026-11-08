@@ -22,12 +22,19 @@ targets:
     platform: iOS
     sources:
       - path: EternalMonitor
+      - path: PyroWaveBench/Streaming.mm
+      - path: PyroWaveBench/vendor/pyrowave_common.mm
+      - path: PyroWaveBench/vendor/pyrowave_decoder.mm
+      - path: PyroWaveBench/vendor/pyrowave_bitstream.cpp
     dependencies:
       - package: Opus
         product: Copus
     settings:
       base:
         INFOPLIST_FILE: EternalMonitor/Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: EternalMonitor/PyroWaveBridge.h
+        CLANG_CXX_LANGUAGE_STANDARD: c++14
+        CLANG_ENABLE_OBJC_ARC: YES
         PRODUCT_BUNDLE_IDENTIFIER: com.eternal.monitor
         TARGETED_DEVICE_FAMILY: "2"
         SUPPORTS_XR: "NO"

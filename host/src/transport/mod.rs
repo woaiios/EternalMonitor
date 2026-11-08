@@ -111,7 +111,13 @@ impl ConfigSource for SharedConfigSource<'_> {
             } else {
                 0
             },
-            bitrate_bps: self.shared.abr_current_bps.load(Ordering::SeqCst),
+            bitrate_bps: if self.shared.active_codec.load(Ordering::SeqCst)
+                == eternal_wire::v2::control::CODEC_PYROWAVE
+            {
+                crate::encoder::pyrowave::bitrate_bps()
+            } else {
+                self.shared.abr_current_bps.load(Ordering::SeqCst)
+            },
         }
     }
 

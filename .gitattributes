@@ -1,0 +1,3 @@
+# Preserve the pinned upstream source byte-for-byte, including generated MSL.
+ios/PyroWaveBench/vendor/** -text whitespace=cr-at-eol
+ios/PyroWaveBench/vendor/shaders/pyrowave_msl.h whitespace=cr-at-eol,-blank-at-eol

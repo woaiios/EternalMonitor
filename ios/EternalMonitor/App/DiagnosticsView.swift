@@ -20,7 +20,7 @@ struct DiagnosticsView: View {
     @State private var copied = false
     @State private var supportIDCopied = false
     private let supportID = DiagnosticsUpload.shared.installationID
-    @AppStorage(DiagnosticsUpload.enabledKey) private var uploadEnabled = true
+    @AppStorage(DiagnosticsUpload.enabledKey) private var uploadEnabled = false
     @State private var uploadStatus = "Checking automatic upload"
 
 

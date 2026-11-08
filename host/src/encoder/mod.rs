@@ -20,6 +20,7 @@ use crate::gpu::{GpuInfo, GpuVendor};
 use crate::stats::PIPELINE_STATS;
 
 pub mod input;
+pub(crate) mod pyrowave;
 use input::{select_input, EncoderInput};
 #[cfg(target_os = "macos")]
 mod vimage;
@@ -137,6 +138,8 @@ fn run_encode_loop(
     let mut last_keyframe_reopen: Option<Instant> = None;
     let mut pending_keyframe = false;
     let mut bitrate_pacer = BitratePacer::default();
+    let mut pyrowave_encoder: Option<pyrowave::Encoder> = None;
+    let mut pyrowave_failed = false;
 
     // Guarantee the very first frame of every pipeline is an IDR for all encoders, so the
     // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
@@ -182,6 +185,83 @@ fn run_encode_loop(
 
         let desired_bitrate = shared.abr_current_bps.load(Ordering::SeqCst).max(500_000);
         let target_fps = shared.effective_fps();
+
+        // Only a newly-capable client on a physical USB link gets this
+        // independent-frame codec. Old clients and Wi-Fi keep the existing
+        // hardware codecs; a DLL/driver failure also falls back for this run.
+        let pyrowave_client = {
+            let session = shared.session.lock();
+            session
+                .peer()
+                .is_some_and(|peer| matches!(peer.link, crate::transport::link::LinkId::Usb { .. }))
+                && session.client_info().is_some_and(|client| {
+                    client.decoder_caps & eternal_wire::v2::control::CAP_DECODE_PYROWAVE != 0
+                })
+        };
+        if pyrowave::requested() && !pyrowave_failed && pyrowave_client {
+            let start = Instant::now();
+            let dimensions = (raw_frame.width, raw_frame.height);
+            let result = (|| {
+                if pyrowave_encoder
+                    .as_ref()
+                    .is_none_or(|encoder| encoder.dimensions() != dimensions)
+                {
+                    pyrowave_encoder = Some(pyrowave::Encoder::new(dimensions.0, dimensions.1)?);
+                }
+                pyrowave_encoder.as_mut().unwrap().encode(
+                    &raw_frame,
+                    pyrowave::bitrate_bps(),
+                    target_fps,
+                )
+            })();
+            match result {
+                Ok(data) => {
+                    let encode_us = start.elapsed().as_micros();
+                    if shared.active_codec.load(Ordering::SeqCst)
+                        != eternal_wire::v2::control::CODEC_PYROWAVE
+                    {
+                        info!(
+                            bitrate_bps = pyrowave::bitrate_bps(),
+                            "USB PyroWave encoder active"
+                        );
+                        note_encoder_opened(&shared, "pyrowave");
+                        PIPELINE_STATS.lock().set_software_fallback(false);
+                    }
+                    PIPELINE_STATS.lock().record_encode(
+                        encode_us,
+                        data.len(),
+                        pyrowave::bitrate_bps(),
+                    );
+                    crate::capture::heartbeat(&shared.hb_encode_frame_ms);
+                    if tx
+                        .blocking_send(NALUnit {
+                            data,
+                            sequence: raw_frame.frame_number,
+                            timestamp: raw_frame.timestamp,
+                            encode_duration_us: encode_us,
+                            is_keyframe: true,
+                        })
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    warn!(%error, "PyroWave unavailable; keeping H.264/HEVC for this pipeline run");
+                    pyrowave_failed = true;
+                    pyrowave_encoder = None;
+                }
+            }
+        }
+        if shared.active_codec.load(Ordering::SeqCst) == eternal_wire::v2::control::CODEC_PYROWAVE {
+            // Reference pictures from before the PyroWave interval cannot be
+            // used by a reconnected or Wi-Fi client. Reopen at a fresh IDR.
+            encoder_state = None;
+            pyrowave_encoder = None;
+            shared.force_next_idr.store(true, Ordering::SeqCst);
+            note_encoder_opened(&shared, &encoder_name);
+        }
 
         // HEVC negotiation, re-checked every frame so a settings toggle or a
         // new session takes effect at the next frame boundary: the user's
@@ -1661,6 +1741,7 @@ fn codec_display_name_for(encoder_name: &str) -> &str {
         "hevc_qsv" => "HEVC (QSV)",
         "hevc_videotoolbox" => "HEVC (VideoToolbox)",
         "libx265" => "HEVC (x265)",
+        "pyrowave" => "PyroWave (USB)",
         other => other,
     }
 }
@@ -1668,7 +1749,9 @@ fn codec_display_name_for(encoder_name: &str) -> &str {
 /// After every successful encoder open: report the live codec on the wire
 /// (HELLO_ACK/heartbeat `StreamConfig.codec`) and in the GUI.
 fn note_encoder_opened(shared: &SharedControl, encoder_name: &str) {
-    let codec = if is_hevc_encoder(encoder_name) {
+    let codec = if encoder_name == "pyrowave" {
+        eternal_wire::v2::control::CODEC_PYROWAVE
+    } else if is_hevc_encoder(encoder_name) {
         eternal_wire::v2::control::CODEC_HEVC
     } else {
         eternal_wire::v2::control::CODEC_H264

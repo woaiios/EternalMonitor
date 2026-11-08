@@ -166,7 +166,7 @@ struct SettingsView: View {
                             )
                             infoRow(
                                 L("Video format"),
-                                config.codec == StreamConfig.codecHEVC ? "HEVC (H.265)" : "H.264",
+                                config.codecName,
                                 "cpu"
                             )
                             infoRow(

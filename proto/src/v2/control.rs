@@ -27,11 +27,13 @@ pub const MAX_NAME_LEN: usize = 64;
 /// Codec identifiers used in [`StreamConfig`] and [`Hello2::decoder_caps`].
 pub const CODEC_H264: u8 = 0;
 pub const CODEC_HEVC: u8 = 1;
+pub const CODEC_PYROWAVE: u8 = 2;
 
 /// [`Hello2::decoder_caps`] bits.
 pub const CAP_DECODE_H264: u16 = 1 << 0;
 pub const CAP_DECODE_HEVC: u16 = 1 << 1;
 pub const CAP_DECODE_HEVC_10BIT: u16 = 1 << 2;
+pub const CAP_DECODE_PYROWAVE: u16 = 1 << 3;
 
 /// [`Hello2::feature_caps`] bits.
 pub const FEATURE_WANTS_INPUT: u16 = 1 << 0;

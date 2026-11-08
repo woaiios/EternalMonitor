@@ -730,7 +730,8 @@ final class ConnectionManager: ObservableObject {
             screenPtW: UInt16(clamping: Int(screen.bounds.width)),
             screenPtH: UInt16(clamping: Int(screen.bounds.height)),
             refreshHz: UInt8(clamping: screen.maximumFramesPerSecond),
-            decoderCaps: Hello2.capDecodeH264 | Hello2.capDecodeHEVC,
+            decoderCaps: Hello2.capDecodeH264 | Hello2.capDecodeHEVC |
+                (isUSB && PyroWaveVideoDecoder.supported ? Hello2.capDecodePyroWave : 0),
             featureCaps: Self.featureCaps(wantsInput: wantsInput, wantsAudio: wantsAudio, isUSB: isUSB),
             deviceId: DeviceIdentity.load(),
             preferredFPS: drawing.preferredFPS(UserDefaults.standard.frameRatePreference(), maximum: screen.maximumFramesPerSecond),

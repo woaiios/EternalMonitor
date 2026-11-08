@@ -15,7 +15,7 @@ enum FirstRun {
         "controlPC", "drawingMode", "commandAsControl", "autoReconnect", "targetFPS", "pictureFit",
         "preferUSB", "promotionEnabled",
         "checkForUpdates", "updateDismissedBuild", "updatePopupClosedBuild",
-        DiagnosticsUpload.enabledKey, FeedbackAsk.sessionsKey, FeedbackAsk.doneKey,
+        "automaticallyShareDiagnostics", DiagnosticsUpload.enabledKey, FeedbackAsk.sessionsKey, FeedbackAsk.doneKey,
         StarAsk.tappedKey, StarAsk.closedKey,
     ]
 

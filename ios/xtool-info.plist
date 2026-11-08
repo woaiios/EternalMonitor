@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleShortVersionString</key><string>0.3.4</string>
+  <key>CFBundleVersion</key><string>8</string>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>UIApplicationSupportsIndirectInputEvents</key><true/>
+  <key>UIDeviceFamily</key><array><integer>2</integer></array>
+  <key>UISupportedInterfaceOrientations~ipad</key><array>
+    <string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationPortraitUpsideDown</string>
+    <string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string>
+  </array>
+  <key>NSLocalNetworkUsageDescription</key><string>EternalMonitor receives video from your Windows PC.</string>
+  <key>NSBonjourServices</key><array><string>_eternaldisplay._udp</string></array>
+  <key>NSCameraUsageDescription</key><string>Scan the PC pairing QR code.</string>
+  <key>ITSAppUsesNonExemptEncryption</key><false/>
+  <key>UILaunchScreen</key><dict/>
+</dict></plist>

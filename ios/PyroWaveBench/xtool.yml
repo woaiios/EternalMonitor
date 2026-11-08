@@ -1,0 +1,3 @@
+version: 1
+bundleID: dev.eternalmonitor.PyroWaveBench
+skipLSP: true

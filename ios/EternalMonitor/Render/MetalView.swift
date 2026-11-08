@@ -182,7 +182,16 @@ final class MetalRenderer {
         self.commandQueue = queue
 
         // Load shaders
-        guard let library = device.makeDefaultLibrary(),
+        #if SWIFT_PACKAGE
+        // xtool builds on Windows/WSL; compile the same bundled MSL source
+        // at runtime instead of requiring Xcode's offline metal compiler.
+        let library = Bundle.main.url(forResource: "Shaders", withExtension: "metal")
+            .flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+            .flatMap { try? device.makeLibrary(source: $0, options: nil) }
+        #else
+        let library = device.makeDefaultLibrary()
+        #endif
+        guard let library,
               let vertexFunc = library.makeFunction(name: "fullscreen_vertex"),
               let fragmentFunc = library.makeFunction(name: "display_fragment") else {
             fatalError("Failed to load Metal shaders")

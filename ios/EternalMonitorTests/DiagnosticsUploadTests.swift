@@ -2,6 +2,33 @@ import XCTest
 @testable import EternalMonitor
 
 final class DiagnosticsUploadTests: XCTestCase {
+    func testSharingDefaultsOffAndDiscardsLegacyOutbox() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let suite = UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { try? FileManager.default.removeItem(at: directory); defaults.removePersistentDomain(forName: suite) }
+        // A default-on preference from an old release is not opt-in.
+        defaults.set(true, forKey: "automaticallyShareDiagnostics")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let batch = DiagnosticsUpload.Batch(batch_id: "legacy", installation_id: "old-install", launch_id: "old-launch", platform: "ipad", app_version: "0.3.4", build: "1", events: [])
+        try JSONEncoder().encode(batch).write(to: directory.appendingPathComponent("old.json"))
+        let config = DiagnosticsUpload.Configuration(endpoint: URL(string: "https://upload.invalid/v1/events")!, ingestKey: "write-only", allowHTTP: false)
+        let upload = DiagnosticsUpload(directory: directory, configuration: config, defaults: defaults)
+        defer { upload.shutdown() }
+        XCTAssertFalse(upload.enabled)
+        upload.record(level: "error", category: "decode", message: "must stay local", timestamp: Date())
+        upload.flushSoon()
+        let status = await upload.status()
+        XCTAssertTrue(status.contains("Automatic upload disabled"), status)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).isEmpty)
+        upload.setEnabled(true)
+        XCTAssertTrue(upload.enabled)
+        XCTAssertEqual(defaults.object(forKey: DiagnosticsUpload.enabledKey) as? Bool, true)
+        upload.setEnabled(false)
+        XCTAssertFalse(upload.enabled)
+        XCTAssertEqual(defaults.object(forKey: DiagnosticsUpload.enabledKey) as? Bool, false)
+    }
+
     func testRejectsUnencryptedAndCredentialBearingEndpoints() {
         XCTAssertTrue(DiagnosticsUpload.Configuration(endpoint: URL(string: "https://logs.example/v1/events")!, ingestKey: "write-only", allowHTTP: false).valid)
         for address in ["http://logs.example/v1/events", "https://secret@logs.example/v1/events", "https://logs.example/v1/events?key=secret"] {
@@ -16,6 +43,7 @@ final class DiagnosticsUploadTests: XCTestCase {
         let config = DiagnosticsUpload.Configuration(endpoint: URL(string: "http://127.0.0.1:1/v1/events")!, ingestKey: "write-only", allowHTTP: true)
         let upload = DiagnosticsUpload(directory: directory, configuration: config, defaults: defaults)
         defer { upload.shutdown() }
+        upload.setEnabled(true)
         upload.record(level: "error", category: "decode", message: "VTDecodeFrame status=-12909 pairing_code=123456 authToken=secret session_id=987654", timestamp: Date())
         let status = await upload.status()
         XCTAssertTrue(status.contains("pending_batches=1"), status)
@@ -42,6 +70,7 @@ final class DiagnosticsUploadTests: XCTestCase {
         let config = DiagnosticsUpload.Configuration(endpoint: URL(string: "http://127.0.0.1:1/v1/events")!, ingestKey: "write-only", allowHTTP: true)
         let upload = DiagnosticsUpload(directory: directory, configuration: config, defaults: defaults)
         defer { upload.shutdown() }
+        upload.setEnabled(true)
         SupportDiagnostics.notePCName("ASH-DESKTOP")
         for message in [
             "Session 5 established with ASH-DESKTOP",
@@ -70,6 +99,7 @@ final class DiagnosticsUploadTests: XCTestCase {
         let config = DiagnosticsUpload.Configuration(endpoint: URL(string: "http://127.0.0.1:1/v1/events")!, ingestKey: "write-only", allowHTTP: true)
         let upload = DiagnosticsUpload(directory: directory, configuration: config, defaults: defaults)
         defer { upload.shutdown() }
+        upload.setEnabled(true)
         let addresses = (0..<40).map { "studio-\($0)-annex.local" } + ["jane-office.local"]
         for address in addresses {
             SupportDiagnostics.noteTypedAddress(address)
@@ -97,6 +127,7 @@ final class DiagnosticsUploadTests: XCTestCase {
         configuration.protocolClasses = [DiagnosticsUploadProtocol.self]
         let upload = DiagnosticsUpload(directory: directory, configuration: .init(endpoint: URL(string: "https://upload.invalid/v1/events")!, ingestKey: "write-only", allowHTTP: false), defaults: defaults, sessionConfiguration: configuration)
         defer { upload.shutdown(); try? FileManager.default.removeItem(at: directory); defaults.removePersistentDomain(forName: suite) }
+        upload.setEnabled(true)
         DiagnosticsUploadProtocol.match = false
         upload.record(level: "error", category: "decode", message: "status=-12909", timestamp: Date())
         _ = await upload.status()
@@ -127,6 +158,7 @@ final class DiagnosticsUploadTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         let upload = DiagnosticsUpload(directory: directory, configuration: .init(endpoint: URL(string: "http://127.0.0.1:1/v1/events")!, ingestKey: "write-only", allowHTTP: true), defaults: defaults)
         defer { upload.shutdown(); try? FileManager.default.removeItem(at: directory); defaults.removePersistentDomain(forName: suite) }
+        upload.setEnabled(true)
         let message = String(repeating: "\u{01}", count: 8192)
         for _ in 0..<40 { upload.record(level: "error", category: "storage", message: message, timestamp: Date()) }
         let failedStatus = await upload.status()

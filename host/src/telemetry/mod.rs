@@ -35,7 +35,7 @@ const FINAL_WRITE_WAIT: Duration = Duration::from_millis(250);
 /// launch's own sequence, which the backend keeps unique per launch.
 pub const FOREIGN_SEQUENCE_BASE: u64 = 1 << 40;
 static SENDER: OnceLock<mpsc::SyncSender<Queued>> = OnceLock::new();
-static ENABLED: AtomicBool = AtomicBool::new(true);
+static ENABLED: AtomicBool = AtomicBool::new(false);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<String> = Mutex::new(String::new());
 /// What Settings tells the user, in plain words; [`STATUS`] is for support.
@@ -220,18 +220,35 @@ pub fn launch_id() -> Option<String> {
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
+// An absent preference (including an upgrade from default-on releases) is
+// not consent. The old opt-out marker still takes precedence.
+fn sharing_enabled(base: &Path) -> bool {
+    base.join("diagnostics-upload-enabled").is_file()
+        && !base.join("diagnostics-upload-disabled").exists()
+}
+
+fn save_sharing(base: &Path, value: bool) -> std::io::Result<()> {
+    let enabled = base.join("diagnostics-upload-enabled");
+    let disabled = base.join("diagnostics-upload-disabled");
+    if value {
+        fs::write(&enabled, b"enabled")?;
+        match fs::remove_file(disabled) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    } else {
+        fs::write(disabled, b"disabled")?;
+        match fs::remove_file(enabled) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn set_enabled(value: bool) {
-    let path = crate::settings::app_data_dir().map(|p| p.join("diagnostics-upload-disabled"));
-    if let Some(path) = path {
-        let result = if value {
-            if path.exists() {
-                fs::remove_file(path)
-            } else {
-                Ok(())
-            }
-        } else {
-            fs::write(path, b"disabled")
-        };
+    if let Some(base) = crate::settings::app_data_dir() {
+        let result = save_sharing(&base, value);
         if result.is_err() {
             SAVE_FAILED.store(true, Ordering::Relaxed);
             set_status("Could not save automatic upload preference");
@@ -399,8 +416,7 @@ fn keep_queued(
 impl UploadGuard {
     pub fn start() -> Self {
         ENABLED.store(
-            !crate::settings::app_data_dir()
-                .is_some_and(|p| p.join("diagnostics-upload-disabled").exists()),
+            crate::settings::app_data_dir().is_some_and(|p| sharing_enabled(&p)),
             Ordering::Relaxed,
         );
         let Some(config) = Config::load() else {
@@ -515,9 +531,7 @@ pub fn queue_for_launch(
     let Some(base) = crate::settings::app_data_dir() else {
         return Ok(());
     };
-    if base.join("diagnostics-upload-disabled").exists()
-        || !Config::load().is_some_and(|c| c.enabled)
-    {
+    if !sharing_enabled(&base) || !Config::load().is_some_and(|c| c.enabled) {
         return Ok(());
     }
     queue_foreign(
@@ -918,9 +932,33 @@ mod tests {
     /// from other tests' threads for over a minute.
     static SHARING: std::sync::RwLock<()> = std::sync::RwLock::new(());
     fn sharing_on() -> std::sync::RwLockReadGuard<'static, ()> {
-        SHARING
+        let guard = SHARING
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ENABLED.store(true, Ordering::Relaxed);
+        guard
+    }
+
+    #[test]
+    fn sharing_requires_explicit_opt_in_and_respects_legacy_opt_out() {
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        assert!(!sharing_enabled(&directory));
+        // A configured endpoint or queued events from an older release do
+        // not count as consent.
+        fs::write(directory.join("diagnostics-upload.json"), b"{}").unwrap();
+        fs::create_dir(directory.join("diagnostics-outbox")).unwrap();
+        assert!(!sharing_enabled(&directory));
+        save_sharing(&directory, true).unwrap();
+        assert!(sharing_enabled(&directory));
+        fs::write(directory.join("diagnostics-upload-disabled"), b"disabled").unwrap();
+        assert!(!sharing_enabled(&directory));
+        save_sharing(&directory, true).unwrap();
+        assert!(sharing_enabled(&directory));
+        save_sharing(&directory, false).unwrap();
+        assert!(!sharing_enabled(&directory));
+        assert!(!directory.join("diagnostics-upload-enabled").exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     /// How long a test waits for a step that takes milliseconds. Only a
@@ -1157,6 +1195,7 @@ mod tests {
         let _sharing = SHARING
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ENABLED.store(true, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(id().unwrap());
         fs::create_dir_all(&directory).unwrap();
         let config = Config {

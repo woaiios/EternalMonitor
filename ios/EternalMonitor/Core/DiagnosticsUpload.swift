@@ -55,7 +55,8 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
     private let launchID = UUID().uuidString
     private var dropped = 0
     private let lossLock = NSLock()
-    static let enabledKey = "automaticallyShareDiagnostics"
+    // The old default-on preference is not explicit consent after upgrading.
+    static let enabledKey = "automaticallyShareDiagnosticsOptIn"
 
     init(directory: URL? = nil, configuration: Configuration? = Configuration.load(), defaults: UserDefaults = .standard, sessionConfiguration: URLSessionConfiguration? = nil) {
         self.directory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("DiagnosticsOutbox", isDirectory: true)
@@ -71,7 +72,9 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
         config.timeoutIntervalForResource = 10
         session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
         // A test instance without an endpoint can exercise disk persistence without network traffic.
-        if configuration != nil { statusText = "Automatic upload enabled; waiting for events" }
+        if configuration != nil {
+            statusText = enabled ? "Automatic upload enabled; waiting for events" : "Automatic upload disabled"
+        }
         queue.async {
             do {
                 try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true,
@@ -80,6 +83,9 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
                 var values = URLResourceValues(); values.isExcludedFromBackup = true
                 try? url.setResourceValues(values)
             } catch { self.statusText = "Automatic upload outbox unavailable: \(error.localizedDescription)" }
+            if !self.enabled {
+                for url in self.files() { try? FileManager.default.removeItem(at: url) }
+            }
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now() + 1, repeating: 5)
             timer.setEventHandler { [weak self] in self?.flush() }
@@ -88,7 +94,7 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
         }
     }
     func shutdown() { queue.sync { timer?.cancel(); timer = nil; session.invalidateAndCancel() } }
-    var enabled: Bool { defaults.object(forKey: Self.enabledKey) as? Bool ?? true }
+    var enabled: Bool { defaults.object(forKey: Self.enabledKey) as? Bool ?? false }
     var configured: Bool { configuration != nil }
     func setEnabled(_ enabled: Bool) {
         defaults.set(enabled, forKey: Self.enabledKey)

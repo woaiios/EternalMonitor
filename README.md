@@ -6,6 +6,8 @@
 
 # EternalMonitor
 
+Local USB PyroWave preview: [implementation, measurements and handoff](docs/HANDOFF_PYROWAVE.md).
+
 A free, open-source second monitor for Windows.<br>
 Connect your iPad over Wi-Fi or USB, with touch and Apple Pencil support.
 
@@ -127,6 +129,7 @@ addresses, but exclude screen content, audio and pairing credentials. From
 0.3.4, Windows uploads remove the PC's name, the user name, the user folder,
 the iPad's name and audio device names, keeping only each audio device's kind,
 and iPad uploads remove the PC's name. Disable automatic sharing in Settings.
+Automatic sharing is off by default and requires enabling in Settings.
 Diagnostics are kept up to 30 days and may be removed sooner. Deleted or
 expired diagnostics can remain in daily backups for up to 7 more days. See
 [Automatic diagnostics](SETUP.md#automatic-diagnostics) and the

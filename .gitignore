@@ -18,8 +18,21 @@ GIT_POLICY.md
 # Installer build staging + output (scripts/build-installer.ps1)
 /build/
 
+# go-ios creates device identity material and developer-image caches in cwd
+/selfIdentity.plist
+/devimages/
+
 # iOS archive/export artifacts
 ios/build/
+ios/.build/
+ios/.swiftpm/
+ios/.bsp/
+ios/xtool/
+ios/xtool-resources/
+ios/PyroWaveBench/.build/
+ios/PyroWaveBench/.swiftpm/
+ios/PyroWaveBench/.bsp/
+ios/PyroWaveBench/xtool/
 
 # Generated Xcode project — project.yml is the source of truth (run `xcodegen generate` in ios/)
 ios/EternalMonitor.xcodeproj/

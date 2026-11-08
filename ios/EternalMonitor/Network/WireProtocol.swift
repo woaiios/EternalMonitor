@@ -210,6 +210,14 @@ struct StreamConfig: Equatable {
     static let size = 16
     static let codecH264: UInt8 = 0
     static let codecHEVC: UInt8 = 1
+    static let codecPyroWave: UInt8 = 2
+    var codecName: String {
+        switch codec {
+        case Self.codecHEVC: return "HEVC (H.265)"
+        case Self.codecPyroWave: return "PyroWave"
+        default: return "H.264"
+        }
+    }
     static let flagSoftwareEncoder: UInt8 = 1 << 0
 
     var streamEpoch: UInt32 = 0
@@ -250,6 +258,7 @@ struct Hello2: Equatable {
     static let capDecodeH264: UInt16 = 1 << 0
     static let capDecodeHEVC: UInt16 = 1 << 1
     static let capDecodeHEVC10Bit: UInt16 = 1 << 2
+    static let capDecodePyroWave: UInt16 = 1 << 3
     static let featureWantsInput: UInt16 = 1 << 0
     static let featureWantsAudio: UInt16 = 1 << 1
     static let featureSupportsNack: UInt16 = 1 << 2
