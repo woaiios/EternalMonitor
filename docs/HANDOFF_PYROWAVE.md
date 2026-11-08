@@ -2,6 +2,12 @@
 
 更新：2026-11-08，Windows 工作目录 `D:\lab\EternalMonitor`。
 
+## 用户确认：游戏显示位置已解决（2026-11-08）
+
+用户自行将 iPad 对应的 Windows 虚拟显示器设为主显示器，并明确确认游戏显示位置问题已解决。这是本机显示配置变更，没有新增游戏移动代码；无需继续自动操作游戏窗口。传输视频继续保留 2388×1668。
+
+用户同时澄清：下方原生分辨率串流短测时，游戏实际位于物理主显示器，而非被采集的 iPad 虚拟屏。因此该轮数据仅可作为当时被采集桌面的链路测量，**不能代表原生分辨率游戏场景性能**。后续游戏负载测试应在当前显示位置确认后重新采样；不要把这轮数据当成已经验证游戏持续 120fps。
+
 ## 当前运行档：原生分辨率串流（2026-11-08 17:15 JST）
 
 用户要求把传输视频恢复为 **2388×1668**，已执行；本节覆盖下方 720 高度试验档的运行状态。保持 GPU capture / GPU conversion、AMD capture LUID、graphics queue、170Mbps 上限、请求 120fps、USB batch 64，FrameTrace 显式开启。没有改 iPad 默认渲染调度，没有更改画质算法，没有启动 WDA。
@@ -12,7 +18,7 @@ $env:ETERNAL_USB_BATCH_DGRAMS='64'
 ./scripts/win/Run-PyroWave.ps1 -Release -FrameTrace -GpuCapture -VideoHeight 0 -GpuQueue graphics -Gpu amd -Mbps 170 -Fps 120
 ```
 
-日志已确认 input_width=2388 input_height=1668 width=2388 height=1668。60 秒短测中有静止/低变化时段；完整呈现链路有效样本 33，不能据此承诺连续游戏 120fps 长期稳定。活动时段观察到约 120fps，接收报告 dropped=0、decode_depth=0。
+日志已确认 input_width=2388 input_height=1668 width=2388 height=1668。60 秒短测中有静止/低变化时段；完整呈现链路有效样本 33，不能据此承诺连续游戏 120fps 长期稳定。桌面变化活跃时段观察到约 120fps，接收报告 dropped=0、decode_depth=0。用户随后确认该轮游戏不在被采集屏，适用范围见上节。
 
 - AMD encode_total：p50 6.927ms / p95 8.873ms。
 - 首分片接收→组装完成：1.213 / 2.479ms。
