@@ -28,7 +28,10 @@ impl Encoder {
     pub fn dimensions(&self) -> (u32, u32) {
         (0, 0)
     }
-    pub fn encode(&mut self, _: &RawFrame, _: u32, _: u32) -> Result<Vec<u8>, String> {
+    pub fn convert(&mut self, _: &RawFrame) -> Result<(), String> {
+        Err("PyroWave encoding requires Windows".into())
+    }
+    pub fn encode(&mut self, _: u32, _: u32) -> Result<Vec<u8>, String> {
         Err("PyroWave encoding requires Windows".into())
     }
 }
@@ -148,14 +151,234 @@ mod native {
             Err(format!("PyroWave {operation} failed: {code}"))
         }
     }
+
+    /// One horizontal band of a picture, converted by one thread. Bands start
+    /// on even rows, so each band's 4:2:0 chroma lines average the same input
+    /// rows a full-frame conversion would.
+    struct Band {
+        y: usize,
+        rows: usize,
+    }
+
+    /// `height` split into `wanted` even-row bands that cover it exactly.
+    fn bands(height: u32, wanted: usize) -> Vec<Band> {
+        assert_eq!(height % 2, 0, "PyroWave requires an even height");
+        let chroma_rows = (height / 2) as usize;
+        let count = wanted.clamp(1, chroma_rows);
+        let base = chroma_rows / count;
+        let extra = chroma_rows % count;
+        let mut bands = Vec::with_capacity(count);
+        let mut y = 0;
+        for index in 0..count {
+            let rows = (base + usize::from(index < extra)) * 2;
+            bands.push(Band { y, rows });
+            y += rows;
+        }
+        debug_assert_eq!(y, height as usize);
+        bands
+    }
+
+    /// How many threads convert one frame: at native iPad resolution a
+    /// single-threaded conversion costs more than the 8.33 ms a 120 fps
+    /// frame has. `ETERNAL_PYROWAVE_THREADS` overrides the default.
+    fn convert_threads() -> usize {
+        let default = std::thread::available_parallelism()
+            .map_or(4, |count| count.get())
+            .clamp(1, 8);
+        std::env::var("ETERNAL_PYROWAVE_THREADS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|count| (1..=32).contains(count))
+            .unwrap_or(default)
+    }
+
+    /// One band's conversion, sent to its thread.
+    struct Job {
+        src: *const u8,
+        row_stride: usize,
+        rows: usize,
+        dst: [*mut u8; 3],
+        dst_stride: [libc::c_int; 3],
+    }
+    // SAFETY: the encoder thread owns the capture rows and output planes a job
+    // points at, and waits for every job of a frame to report back before it
+    // reads the planes or hands the capture buffer back.
+    unsafe impl Send for Job {}
+
+    /// `SwsContext` is not `Send` in ffmpeg-next; this one is moved into a
+    /// thread and only ever used there.
+    struct Owned(ffmpeg_next::software::scaling::Context);
+    unsafe impl Send for Owned {}
+
+    impl Owned {
+        fn context(&mut self) -> &mut ffmpeg_next::software::scaling::Context {
+            &mut self.0
+        }
+    }
+
+    /// BGRA rows converted into one YUV420P frame, one thread per band.
+    struct Sliced {
+        jobs: Vec<std::sync::mpsc::Sender<Job>>,
+        results: std::sync::mpsc::Receiver<Result<(), String>>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+        bands: Vec<Band>,
+        frame: ffmpeg_next::frame::Video,
+        width: u32,
+        height: u32,
+    }
+
+    impl Sliced {
+        fn new(width: u32, height: u32, wanted: usize) -> Result<Self, String> {
+            let bands = bands(height, wanted);
+            let (results, result_rx) = std::sync::mpsc::channel();
+            let mut jobs = Vec::with_capacity(bands.len());
+            let mut threads = Vec::with_capacity(bands.len());
+            for (index, band) in bands.iter().enumerate() {
+                let scaler =
+                    crate::encoder::input::band_conversion_context(width, band.rows as u32)
+                        .map_err(|error| format!("PyroWave band converter: {error}"))?;
+                let (sender, receiver) = std::sync::mpsc::channel::<Job>();
+                let results = results.clone();
+                let mut scaler = Owned(scaler);
+                let handle = std::thread::Builder::new()
+                    .name(format!("pyrowave-convert-{index}"))
+                    .spawn(move || {
+                        while let Ok(job) = receiver.recv() {
+                            let src = [
+                                job.src,
+                                std::ptr::null(),
+                                std::ptr::null(),
+                                std::ptr::null(),
+                            ];
+                            let src_stride = [job.row_stride as libc::c_int, 0, 0, 0];
+                            // sws_scale reads `job.rows` rows of `job.row_stride`
+                            // from `job.src`, which lies inside the capture
+                            // buffer, and writes each plane at `job.dst`.
+                            let written = unsafe {
+                                ffmpeg_next::ffi::sws_scale(
+                                    scaler.context().as_mut_ptr(),
+                                    src.as_ptr(),
+                                    src_stride.as_ptr(),
+                                    0,
+                                    job.rows as libc::c_int,
+                                    job.dst.as_ptr(),
+                                    job.dst_stride.as_ptr(),
+                                )
+                            };
+                            let outcome = if written < 0 {
+                                Err(format!("PyroWave band conversion failed: {written}"))
+                            } else {
+                                Ok(())
+                            };
+                            if results.send(outcome).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .map_err(|error| format!("PyroWave conversion thread: {error}"))?;
+                jobs.push(sender);
+                threads.push(handle);
+            }
+            Ok(Self {
+                jobs,
+                results: result_rx,
+                threads,
+                bands,
+                frame: ffmpeg_next::frame::Video::new(
+                    ffmpeg_next::format::Pixel::YUV420P,
+                    width,
+                    height,
+                ),
+                width,
+                height,
+            })
+        }
+
+        /// Converts `rows` (capture's snug BGRA picture) into this frame and
+        /// returns when every band is done.
+        fn convert(&mut self, rows: &[u8]) -> Result<(), String> {
+            let row_bytes = self.width as usize * 4;
+            let frame_bytes = row_bytes * self.height as usize;
+            if rows.len() < frame_bytes {
+                return Err("PyroWave input frame is shorter than its size".into());
+            }
+            // swscale reads up to FRAME_PADDING past the last row; capture's
+            // buffers have that much, anything else is copied once.
+            let padded;
+            let rows = if rows.len() < frame_bytes + crate::capture::FRAME_PADDING {
+                let mut copy = vec![0u8; frame_bytes + crate::capture::FRAME_PADDING];
+                copy[..frame_bytes].copy_from_slice(&rows[..frame_bytes]);
+                padded = copy;
+                &padded[..]
+            } else {
+                rows
+            };
+            let frame = unsafe { self.frame.as_mut_ptr() };
+            let data = unsafe { (*frame).data };
+            let strides = unsafe {
+                [
+                    (*frame).linesize[0] as usize,
+                    (*frame).linesize[1] as usize,
+                    (*frame).linesize[2] as usize,
+                ]
+            };
+            for (sender, band) in self.jobs.iter().zip(&self.bands) {
+                let chroma_y = band.y / 2;
+                let job = Job {
+                    src: unsafe { rows.as_ptr().add(band.y * row_bytes) },
+                    row_stride: row_bytes,
+                    rows: band.rows,
+                    dst: [
+                        unsafe { data[0].add(band.y * strides[0]) },
+                        unsafe { data[1].add(chroma_y * strides[1]) },
+                        unsafe { data[2].add(chroma_y * strides[2]) },
+                    ],
+                    dst_stride: [
+                        strides[0] as libc::c_int,
+                        strides[1] as libc::c_int,
+                        strides[2] as libc::c_int,
+                    ],
+                };
+                if sender.send(job).is_err() {
+                    return Err("PyroWave conversion thread stopped".into());
+                }
+            }
+            let mut failure = None;
+            for _ in 0..self.jobs.len() {
+                match self.results.recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        failure.get_or_insert(error);
+                    }
+                    Err(_) => return Err("PyroWave conversion threads stopped".into()),
+                }
+            }
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        fn frame(&self) -> &ffmpeg_next::frame::Video {
+            &self.frame
+        }
+    }
+
+    impl Drop for Sliced {
+        fn drop(&mut self) {
+            self.jobs.clear();
+            for thread in self.threads.drain(..) {
+                let _ = thread.join();
+            }
+        }
+    }
     pub(crate) struct Encoder {
         api: Api,
         device: Handle,
         encoder: Handle,
         width: u32,
         height: u32,
-        scaler: ffmpeg_next::software::scaling::Context,
-        frame: ffmpeg_next::frame::Video,
+        convert: Sliced,
         output: Vec<u8>,
     }
     impl Drop for Encoder {
@@ -182,23 +405,14 @@ mod native {
             {
                 return Err("PyroWave requires even dimensions between 64 and 4096".into());
             }
-            let scaler = super::super::input::conversion_context(
-                ffmpeg_next::format::Pixel::YUV420P,
-                width,
-                height,
-            )
-            .map_err(|e| e.to_string())?
-            .ok_or("No BGRA to YUV converter")?;
-            let frame =
-                ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
+            let convert = Sliced::new(width, height, convert_threads())?;
             let mut state = Self {
                 api: Api::load()?,
                 device: std::ptr::null_mut(),
                 encoder: std::ptr::null_mut(),
                 width,
                 height,
-                scaler,
-                frame,
+                convert,
                 output: Vec::new(),
             };
             let vendor = match std::env::var("ETERNAL_PYROWAVE_GPU").as_deref() {
@@ -236,18 +450,20 @@ mod native {
             }
             Ok(state)
         }
-        pub fn encode(
-            &mut self,
-            raw: &RawFrame,
-            bitrate: u32,
-            fps: u32,
-        ) -> Result<Vec<u8>, String> {
-            super::super::input::convert_packed_bgra(&mut self.scaler, &raw.data, &mut self.frame)
-                .map_err(|e| e.to_string())?;
+        /// Converts `raw` into the encoder's YUV420P input picture; [`encode`]
+        /// then encodes it. Split from `encode` so the pipeline can report and
+        /// budget conversion and encoding separately.
+        ///
+        /// [`encode`]: Self::encode
+        pub fn convert(&mut self, raw: &RawFrame) -> Result<(), String> {
+            self.convert.convert(&raw.data)
+        }
+        pub fn encode(&mut self, bitrate: u32, fps: u32) -> Result<Vec<u8>, String> {
+            let frame = self.convert.frame();
             let input = CpuBuffer {
-                data: std::array::from_fn(|p| self.frame.data(p).as_ptr() as Handle),
-                strides: std::array::from_fn(|p| self.frame.stride(p)),
-                sizes: std::array::from_fn(|p| self.frame.data(p).len()),
+                data: std::array::from_fn(|p| frame.data(p).as_ptr() as Handle),
+                strides: std::array::from_fn(|p| frame.stride(p)),
+                sizes: std::array::from_fn(|p| frame.data(p).len()),
                 width: self.width as i32,
                 height: self.height as i32,
                 format: 1,
@@ -306,6 +522,97 @@ mod native {
                 data.extend_from_slice(&self.output[packet.offset..end]);
             }
             Ok(data)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn pattern(bytes: &mut [u8], row_bytes: usize) {
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = (index * 131 + index / row_bytes * 29) as u8;
+            }
+        }
+
+        #[test]
+        fn bands_tile_the_picture_on_even_rows() {
+            for height in [18u32, 64, 1080, 1668] {
+                for wanted in [1usize, 2, 3, 5, 8, 32] {
+                    let bands = bands(height, wanted);
+                    let mut y = 0;
+                    for band in &bands {
+                        assert_eq!(band.y, y);
+                        assert_eq!(band.rows % 2, 0, "{height} in {wanted}");
+                        y += band.rows;
+                    }
+                    assert_eq!(y, height as usize, "{height} in {wanted}");
+                    assert!(bands.len() <= wanted);
+                }
+            }
+        }
+
+        /// Luma rows must match; swscale's chroma dithering is indexed by the
+        /// row's position in the picture, so bands may round a chroma sample
+        /// the other way by one.
+        fn assert_same(
+            expected: &ffmpeg_next::frame::Video,
+            actual: &ffmpeg_next::frame::Video,
+            label: &str,
+        ) {
+            for plane in 0..3 {
+                let tolerance = if plane == 0 { 0 } else { 1 };
+                let visible = expected.plane_width(plane) as usize;
+                for y in 0..expected.plane_height(plane) as usize {
+                    let line = |frame: &ffmpeg_next::frame::Video| {
+                        let start = y * frame.stride(plane);
+                        frame.data(plane)[start..start + visible].to_vec()
+                    };
+                    let (want, got) = (line(expected), line(actual));
+                    if tolerance == 0 {
+                        assert_eq!(want, got, "{label} plane {plane} row {y}");
+                        continue;
+                    }
+                    for (x, (want, got)) in want.iter().zip(&got).enumerate() {
+                        assert!(
+                            want.abs_diff(*got) <= tolerance,
+                            "{label} plane {plane} row {y} x {x}: {want} vs {got}"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Bands converted on their own threads give the picture a full-frame
+        /// conversion gives, at widths whose rows align and don't.
+        #[test]
+        fn band_conversion_matches_a_full_frame_conversion() {
+            ffmpeg_next::init().unwrap();
+            for (width, height) in [(2388u32, 1668u32), (1920, 1080), (96, 64), (102, 18)] {
+                let row_bytes = width as usize * 4;
+                let frame_bytes = row_bytes * height as usize;
+                let mut rows = crate::capture::frame_buffer(frame_bytes);
+                pattern(&mut rows[..frame_bytes], row_bytes);
+                let mut scaler = crate::encoder::input::conversion_context(
+                    ffmpeg_next::format::Pixel::YUV420P,
+                    width,
+                    height,
+                )
+                .unwrap()
+                .unwrap();
+                let mut whole =
+                    ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
+                crate::encoder::input::convert_packed_bgra(&mut scaler, &rows, &mut whole).unwrap();
+                for wanted in [1usize, 3, 8] {
+                    let mut sliced = Sliced::new(width, height, wanted).unwrap();
+                    sliced.convert(&rows).unwrap();
+                    assert_same(
+                        &whole,
+                        sliced.frame(),
+                        &format!("{width}x{height} in {wanted} bands"),
+                    );
+                }
+            }
         }
     }
 }

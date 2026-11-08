@@ -24,6 +24,9 @@ struct MetalView: UIViewRepresentable {
         // Redraw only when told to — new frame or size change.
         view.isPaused = true
         view.enableSetNeedsDisplay = true
+        // On-demand drawing ignores this, so it only matters if the view is
+        // ever unpaused: never cap the panel (ProMotion runs at 120 Hz).
+        view.preferredFramesPerSecond = UIScreen.main.maximumFramesPerSecond
         view.backgroundColor = UIColor(red: 0.024, green: 0.027, blue: 0.031, alpha: 1) // Theme.void
         view.clearColor = MTLClearColor(red: 0.024, green: 0.027, blue: 0.031, alpha: 1)
 

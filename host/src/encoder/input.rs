@@ -116,6 +116,16 @@ pub(super) fn conversion_context(
     .map(Some)
 }
 
+/// The same converter as [`conversion_context`], for `rows` of a `width`-wide
+/// picture: PyroWave's parallel path converts horizontal bands of one frame
+/// on their own threads.
+pub(super) fn band_conversion_context(
+    width: u32,
+    rows: u32,
+) -> Result<ffmpeg_next::software::scaling::Context, ffmpeg_next::Error> {
+    conversion_context(Pixel::YUV420P, width, rows)?.ok_or(ffmpeg_next::Error::OutputChanged)
+}
+
 /// Converts capture's tightly packed BGRA rows into `output` where they lie:
 /// swscale reads the capture buffer itself, with no copy into a BGRA frame
 /// first. The call returns when the conversion is done, so the buffer can

@@ -1598,7 +1598,10 @@ private extension UserDefaults {
     }
 
     func frameRatePreference() -> Int {
+        // Nothing stored means the panel's maximum (120 on ProMotion iPad
+        // Pro); the host and `DrawingProfile.preferredFPS` clamp it to what
+        // the screen and the host's own target can actually show.
         let fps = integer(forKey: "targetFPS")
-        return [30, 60, 120].contains(fps) ? fps : 60
+        return [30, 60, 120].contains(fps) ? fps : 120
     }
 }

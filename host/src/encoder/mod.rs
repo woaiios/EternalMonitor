@@ -211,14 +211,15 @@ fn run_encode_loop(
                 {
                     pyrowave_encoder = Some(pyrowave::Encoder::new(dimensions.0, dimensions.1)?);
                 }
-                pyrowave_encoder.as_mut().unwrap().encode(
-                    &raw_frame,
-                    pyrowave::bitrate_bps(),
-                    target_fps,
-                )
+                let encoder = pyrowave_encoder.as_mut().unwrap();
+                let converting = Instant::now();
+                encoder.convert(&raw_frame)?;
+                let convert_us = converting.elapsed().as_micros();
+                let data = encoder.encode(pyrowave::bitrate_bps(), target_fps)?;
+                Ok::<_, String>((data, convert_us))
             })();
             match result {
-                Ok(data) => {
+                Ok((data, convert_us)) => {
                     let encode_us = start.elapsed().as_micros();
                     if !pyrowave_reported || shared.active_codec.load(Ordering::SeqCst)
                         != eternal_wire::v2::control::CODEC_PYROWAVE
@@ -231,6 +232,7 @@ fn run_encode_loop(
                         PIPELINE_STATS.lock().set_software_fallback(false);
                         pyrowave_reported = true;
                     }
+                    PIPELINE_STATS.lock().record_convert(convert_us);
                     PIPELINE_STATS.lock().record_encode(
                         encode_us,
                         data.len(),

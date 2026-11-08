@@ -2,14 +2,16 @@ param(
     [switch]$Stop,
     [ValidateSet('amd', 'nvidia', 'auto')][string]$Gpu = 'amd',
     [ValidateRange(100, 1000)][int]$Mbps = 350,
-    [ValidateRange(30, 120)][int]$Fps = 60,
+    [ValidateRange(30, 120)][int]$Fps = 120,
     [switch]$Synthetic,
-    [ValidatePattern('^\d{2,4}x\d{2,4}$')][string]$Size = '1920x1080'
+    [ValidatePattern('^\d{2,4}x\d{2,4}$')][string]$Size = '1920x1080',
+    [switch]$Release
 )
 $ErrorActionPreference = 'Stop'
 $pyroRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $pyroBuild = Join-Path $pyroRoot 'build/pyrowave'
-$pyroExe = Join-Path $pyroRoot 'target/debug/eternal-host.exe'
+$pyroProfile = if ($Release) { 'release' } else { 'debug' }
+$pyroExe = Join-Path $pyroRoot "target/$pyroProfile/eternal-host.exe"
 $pyroRecord = Join-Path $pyroBuild 'running-host.json'
 
 if ($Stop) {

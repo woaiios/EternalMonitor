@@ -20,6 +20,13 @@ PyroWave 使用 GPU compute，不是 AMD AMF 固定功能视频编码器。选�
 - 当前预览安装 ID：`XTL-UH6S3NYDHH.dev.eternalmonitor.PyroWavePreview`，不覆盖原版 App。
 - 已卸载本次自建的独立 PyroWaveBench，给主程序腾出免费签名的 App 名额。用户的 Hello/WDA 保留。
 
+## 本机扩展屏验证（2026-11-08）
+
+- 本机 VDD 绑定 RTX 5090 时，Windows 没有把虚拟屏接入桌面；将 `C:\VirtualDisplayDriver\vdd_settings.xml` 的 `gpu/friendlyname` 设置为 `AMD Radeon(TM) Graphics` 后，虚拟屏成功接入。该配置是本机系统文件，不在 Git 中，也不代表其他机器一定需要 AMD。
+- EternalMonitor 的 `vdd_match_resolution` 已启用；连接此 iPad 后，虚拟屏实测为 2388×1668、120 Hz。游戏移动到虚拟屏后，采集约 110 fps，PyroWave 编码及接收约 60 多 fps，尚未达到 120 fps。
+- 本机有两个 `Root\MttVDD` 设备：`ROOT\DISPLAY\0002` 供 EternalMonitor 使用，`ROOT\DISPLAY\0003` 已停用。为避免再次启用重复设备，本机的 `EternalMonitor VDD Enable/Disable` 计划任务使用 Program Files 中仅匹配 `0002` 的脚本；这些机器专属任务不包含在仓库中。
+- 要复现 GPU 绑定，先备份 VDD 设置文件，再按实际设备名称修改 `gpu/friendlyname`；确认 EternalMonitor 没有覆盖该用户指定名称。切换驱动或设备可能改变 Windows 显示布局，需在目标机器重新验证，不应直接照搬本机实例编号。
+
 ## 启停与即时状态
 
 离开前保留真实桌面串流，使用 AMD / 350 Mbps 上限 / 请求 60fps。主机实际帧率由取帧、桌面变化、客户端偏好等决定；`-Fps 120` 不会覆盖 iPad 的 60fps 偏好。

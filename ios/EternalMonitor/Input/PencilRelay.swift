@@ -88,6 +88,9 @@ struct DrawingProfile {
     let isUSB: Bool
 
     func preferredFPS(_ preference: Int, maximum: Int) -> UInt8 {
-        UInt8(clamping: enabled && isUSB ? min(120, maximum) : preference)
+        // Drawing pins the stream to 120 for pen latency, but the panel still
+        // decides: a 60 Hz screen is never asked for more than it can show.
+        let asked = enabled && isUSB ? 120 : preference
+        return UInt8(clamping: min(asked, maximum))
     }
 }
