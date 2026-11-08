@@ -1,6 +1,33 @@
 import Foundation
 import os
 
+/// Explicit local-only per-frame tracing, sampled by the wire capture clock.
+enum FrameTrace {
+    static let enabled = ProcessInfo.processInfo.arguments.contains("--frame-trace")
+    static let key = "dev.eternalmonitor.trace.capture" as CFString
+    private static let queue = DispatchQueue(label: "dev.eternalmonitor.frame-trace", qos: .utility)
+    private static let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("frame-trace.log")
+    private static let file: FileHandle? = {
+        guard enabled else { return nil }
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        return try? FileHandle(forWritingTo: url)
+    }()
+    static func sampled(_ capture: UInt64) -> Bool { enabled && capture != 0 && capture % 30 == 0 }
+    static func start() { if enabled { _ = file } }
+    static func displayPeriod(_ period: Double) {
+        guard enabled, let file else { return }
+        let line = "event=display_period period_ms=\(period * 1000)\n"
+        queue.async { try? file.write(contentsOf: Data(line.utf8)) }
+    }
+    static func log(_ event: String, capture: UInt64, fields: String = "") {
+        guard sampled(capture), let file else { return }
+        let now = ControlChannel.clientNowUs()
+        let line = "event=\(event) capture_us=\(capture) client_us=\(now) \(fields)\n"
+        queue.async { try? file.write(contentsOf: Data(line.utf8)) }
+    }
+}
+
 /// Control and video share one link. Both implementations use the same
 /// datagram decoder and session filter on their serial control queue.
 /// Why a media link failed. `message` is the support-log wording; the app
@@ -110,6 +137,10 @@ final class MediaDatagrams {
                 }
                 if !reported { onDatagramIgnored?("Dropped media for foreign session \(header.sessionId)") }
                 return
+            }
+            if header.fragIndex == 0 && !header.isRetransmit {
+                FrameTrace.log("receive_first", capture: header.captureTimestampUs,
+                               fields: "epoch=\(header.streamEpoch) seq=\(header.frameSeq)")
             }
             assembler?.addFragment(
                 seq: header.frameSeq,

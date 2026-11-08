@@ -192,7 +192,7 @@ impl VideoQueue {
     /// moves, a still desktop can leave a paused tunnel nothing newer to
     /// send, and the frames queued behind either still decode.
     fn push(&mut self, bytes: &[u8], now: Instant) -> io::Result<u64> {
-        let (header, _) = MediaHeader::decode(bytes).map_err(|_| invalid("video header"))?;
+        let (header, payload) = MediaHeader::decode(bytes).map_err(|_| invalid("video header"))?;
         let key = (header.stream_epoch, header.frame_seq);
         if self.discarded == Some(key) {
             return Ok(0);
@@ -201,6 +201,13 @@ impl VideoQueue {
         if header.frag_index == 0 {
             if self.frames.back().is_some_and(|frame| !frame.complete()) {
                 return Err(invalid("unfinished video access unit"));
+            }
+            // EPW1 pictures are independent. Keep only the newest queued
+            // picture; the writer already owns and finishes its active one.
+            if payload.starts_with(b"EPW1") && header.is_keyframe {
+                dropped += self.frames.len() as u64;
+                self.frames.clear();
+                self.bytes = 0;
             }
             let stream = (header.session_id, header.stream_epoch);
             if self
@@ -652,6 +659,14 @@ impl Drop for FramedLink {
 
 async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) -> io::Result<()> {
     let mut closed = state.closed.subscribe();
+    // Preserve each EMLINK length prefix while amortizing hundreds of small
+    // OS writes per picture. Audio/control pass between bounded batches.
+    let batch_count = std::env::var("ETERNAL_USB_BATCH_DGRAMS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| (1..=64).contains(v))
+        .unwrap_or(32);
+    let mut batch = Vec::with_capacity(batch_count * (MAX_DGRAM_SIZE + 2));
     loop {
         if *closed.borrow() {
             return Ok(());
@@ -668,13 +683,29 @@ async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) ->
             }
             state.wrote(control);
         } else if let Some(frame) = frame {
+            let trace = if std::env::var_os("ETERNAL_FRAME_TRACE").is_some() {
+                frame
+                    .datagrams
+                    .first()
+                    .and_then(|packet| MediaHeader::decode(packet).ok())
+                    .map(|(header, _)| header)
+                    .filter(|header| header.capture_ts_us % 30 == 0)
+            } else {
+                None
+            };
+            let write_start_us = trace.as_ref().map(|_| crate::clock::host_now_us());
             // A frame that has started is finished: the iPad cannot use part
             // of one, and over a lossless tunnel would count the rest as lost.
-            for packet in frame.datagrams {
+            for packets in frame.datagrams.chunks(batch_count) {
+                batch.clear();
+                for packet in packets {
+                    batch.extend_from_slice(&(packet.len() as u16).to_le_bytes());
+                    batch.extend_from_slice(packet);
+                }
                 tokio::select! {
                     biased;
                     _ = closed.changed() => return Ok(()),
-                    sent = write_datagram(&mut writer, &packet) => sent?,
+                    sent = writer.write_all(&batch) => sent?,
                 }
                 // Audio and control can pass between video datagrams, without
                 // ever interrupting a partly written TCP frame prefix/body.
@@ -686,6 +717,16 @@ async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) ->
                     }
                     state.wrote(control);
                 }
+            }
+            if let (Some(header), Some(start)) = (trace, write_start_us) {
+                tracing::info!(
+                    capture_us = header.capture_ts_us,
+                    frame_seq = header.frame_seq,
+                    stream_epoch = header.stream_epoch,
+                    usb_write_start_us = start,
+                    usb_write_done_us = crate::clock::host_now_us(),
+                    "Frame trace USB write"
+                );
             }
         } else {
             // A deferred keyframe request must not wait for the next frame:
@@ -763,6 +804,54 @@ mod tests {
         }
         .encode_into(&mut bytes);
         bytes
+    }
+
+    #[test]
+    fn independent_pyrowave_frames_keep_only_the_latest_complete_picture() {
+        let now = Instant::now();
+        let mut queue = VideoQueue::default();
+        let pyro = |seq, index| {
+            let mut data = packet(seq, true, index, 2, 64);
+            if index == 0 {
+                data[MEDIA_HEADER_SIZE..MEDIA_HEADER_SIZE + 4].copy_from_slice(b"EPW1");
+            }
+            data
+        };
+        queue.push(&pyro(1, 0), now).unwrap();
+        assert!(queue.pop().is_none());
+        queue.push(&pyro(1, 1), now).unwrap();
+        assert_eq!(queue.push(&pyro(2, 0), now).unwrap(), 1);
+        assert!(queue.pop().is_none());
+        queue.push(&pyro(2, 1), now).unwrap();
+        let frame = queue.pop().unwrap();
+        assert_eq!(frame.seq, 2);
+        assert!(frame.complete());
+        assert!(queue.pop().is_none());
+    }
+
+    #[tokio::test]
+    async fn batched_usb_writer_preserves_every_datagram_across_partial_writes() {
+        let (host, mut client) = tokio::io::duplex(97);
+        let peer = PeerId::usb(7);
+        let link = FramedLink::connect(host, peer, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        read_preamble(&mut client).await.unwrap();
+        let expected: Vec<_> = (0..67)
+            .map(|i| packet(1, true, i, 67, if i == 66 { 83 } else { 1400 }))
+            .collect();
+        for data in &expected {
+            link.send(peer, data).await.unwrap();
+        }
+        for data in expected {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), read_datagram(&mut client))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                data
+            );
+        }
     }
 
     #[test]

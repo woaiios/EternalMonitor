@@ -99,6 +99,8 @@ pub fn run_capture_loop(
         heartbeat(&shared.hb_capture_frame_ms);
 
         slot.publish(RawFrame {
+            #[cfg(windows)]
+            gpu: None,
             frame_number: *frame_number,
             timestamp: frame_start,
             data,

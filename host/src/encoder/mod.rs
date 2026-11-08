@@ -26,6 +26,17 @@ use input::{select_input, EncoderInput};
 mod vimage;
 
 const CHANNEL_CAPACITY: usize = 4;
+fn has_gpu_frame(raw: &crate::capture::RawFrame) -> bool {
+    #[cfg(windows)]
+    {
+        raw.gpu.is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = raw;
+        false
+    }
+}
 const AMF_CAPTURE_PACKET_LIMIT: u64 = 120;
 const AMF_IDR_WARNING_PACKET: u64 = 60;
 const AMF_FORCED_INTRA_PERIOD: u64 = 30;
@@ -178,7 +189,7 @@ fn run_encode_loop(
             }
         }
 
-        if raw_frame.data.is_empty() {
+        if raw_frame.data.is_empty() && !has_gpu_frame(&raw_frame) {
             warn!(
                 frame = raw_frame.frame_number,
                 "Skipping frame with empty data"
@@ -203,13 +214,12 @@ fn run_encode_loop(
         };
         if pyrowave::requested() && !pyrowave_failed && pyrowave_client {
             let start = Instant::now();
-            let dimensions = (raw_frame.width, raw_frame.height);
             let result = (|| {
                 if pyrowave_encoder
                     .as_ref()
-                    .is_none_or(|encoder| encoder.dimensions() != dimensions)
+                    .is_none_or(|encoder| !encoder.matches(&raw_frame))
                 {
-                    pyrowave_encoder = Some(pyrowave::Encoder::new(dimensions.0, dimensions.1)?);
+                    pyrowave_encoder = Some(pyrowave::Encoder::from_frame(&raw_frame)?);
                 }
                 let encoder = pyrowave_encoder.as_mut().unwrap();
                 let converting = Instant::now();
@@ -220,9 +230,26 @@ fn run_encode_loop(
             })();
             match result {
                 Ok((data, convert_us)) => {
+                    // Independent pictures already satisfy recovery requests.
+                    // Leaving this set makes DXGI timeout keepalives replay at
+                    // every 4 ms acquire timeout and wastes GPU/USB capacity.
+                    shared.force_next_idr.store(false, Ordering::SeqCst);
                     let encode_us = start.elapsed().as_micros();
-                    if !pyrowave_reported || shared.active_codec.load(Ordering::SeqCst)
-                        != eternal_wire::v2::control::CODEC_PYROWAVE
+                    if std::env::var_os("ETERNAL_FRAME_TRACE").is_some()
+                        && crate::clock::instant_to_us(raw_frame.timestamp) % 30 == 0
+                    {
+                        info!(
+                            capture_us = crate::clock::instant_to_us(raw_frame.timestamp),
+                            frame = raw_frame.frame_number,
+                            encode_done_us = crate::clock::host_now_us(),
+                            encode_us,
+                            convert_us,
+                            "Frame trace encode"
+                        );
+                    }
+                    if !pyrowave_reported
+                        || shared.active_codec.load(Ordering::SeqCst)
+                            != eternal_wire::v2::control::CODEC_PYROWAVE
                     {
                         info!(
                             bitrate_bps = pyrowave::bitrate_bps(),
@@ -254,6 +281,13 @@ fn run_encode_loop(
                     continue;
                 }
                 Err(error) => {
+                    #[cfg(windows)]
+                    if raw_frame.gpu.is_some() {
+                        warn!(%error, "GPU texture path failed; falling back to CPU capture");
+                        crate::capture::gpu::disable();
+                        pyrowave_encoder = None;
+                        continue;
+                    }
                     warn!(%error, "PyroWave unavailable; keeping H.264/HEVC for this pipeline run");
                     pyrowave_failed = true;
                     pyrowave_encoder = None;
@@ -4599,6 +4633,8 @@ mod tests {
             let mut data = crate::capture::frame_buffer(1280 * 720 * 4);
             crate::capture::synthetic::render_synthetic_frame(&mut data, 1280, 720, self.number);
             self.producer.publish(crate::capture::RawFrame {
+                #[cfg(windows)]
+                gpu: None,
                 frame_number: self.number,
                 timestamp: Instant::now(),
                 data: std::sync::Arc::new(data),

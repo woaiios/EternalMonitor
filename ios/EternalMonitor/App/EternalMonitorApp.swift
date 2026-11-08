@@ -7,6 +7,7 @@ struct EternalMonitorApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        FrameTrace.start()
         #if DEBUG
         // UI tests: EM_FRESH_INSTALL=1 starts with nothing saved, as a new
         // install does. Pairings are in the Keychain and stay.

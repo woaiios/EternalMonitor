@@ -9,6 +9,12 @@
 #include <cstring>
 
 namespace {
+id<MTLCommandQueue> shared_queue() {
+    static id<MTLCommandQueue> value;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ value = [MTLCreateSystemDefaultDevice() newCommandQueue]; });
+    return value;
+}
 void require(bool ok, const char *text) { if (!ok) throw std::runtime_error(text); }
 void checked(pyrowave_result code, const char *text) { require(code == PYROWAVE_SUCCESS, text); }
 void failure(char *target, size_t capacity, const char *text) {
@@ -25,8 +31,9 @@ struct StreamDecoder {
     CVPixelBufferPoolRef pool = nullptr;
     CVMetalTextureCacheRef cache = nullptr;
     ~StreamDecoder() {
-        // The entry point completes its command before returning; there is
-        // no outstanding work referencing the decoder's scratch textures.
+        // Drain only at teardown. Decode and render are ordered on one queue.
+        id<MTLCommandBuffer> drain = [queue commandBuffer];
+        [drain commit]; [drain waitUntilCompleted];
         if (decoder) pyrowave_decoder_destroy(decoder);
         if (device) pyrowave_device_destroy(device);
         if (pool) CFRelease(pool);
@@ -37,7 +44,7 @@ struct StreamDecoder {
         width = w; height = h;
         metal = MTLCreateSystemDefaultDevice();
         require(metal && pyrowave_device_is_supported((__bridge void *)metal), "Unsupported PyroWave Metal device");
-        queue = [metal newCommandQueue];
+        queue = shared_queue();
         require(queue != nil, "Cannot create PyroWave command queue");
         pyrowave_device_create_info create = {};
         create.mtl_device = (__bridge void *)metal;
@@ -74,7 +81,7 @@ struct StreamDecoder {
         require(CVMetalTextureCacheCreate(kCFAllocatorDefault, nullptr, metal, nullptr, &cache) == kCVReturnSuccess,
                 "Cannot create PyroWave texture cache");
     }
-    CVPixelBufferRef decode(const void *data, size_t size) {
+    CVPixelBufferRef decode(const void *data, size_t size, bool deferred) {
         require(data && size >= 20 && size <= 4 * 1024 * 1024, "Invalid PyroWave frame size");
         const uint8_t *bytes = static_cast<const uint8_t *>(data);
         auto u16 = [&](size_t at) { return uint32_t(bytes[at]) | (uint32_t(bytes[at + 1]) << 8); };
@@ -115,8 +122,20 @@ struct StreamDecoder {
             [pass setTexture:CVMetalTextureGetTexture(luma) atIndex:3];
             [pass setTexture:CVMetalTextureGetTexture(chroma) atIndex:4];
             [pass dispatchThreads:MTLSizeMake(width, height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-            [pass endEncoding]; [command commit]; [command waitUntilCompleted];
-            require(command.status == MTLCommandBufferStatusCompleted, "PyroWave decode/packing command failed");
+            [pass endEncoding];
+            // Dropped outputs must not return to the pool before GPU packing.
+            CFRetain(pixel); CFRetain(luma); CFRetain(chroma); CFRetain(cache);
+            CVMetalTextureCacheRef held_cache = cache;
+            [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                CFRelease(pixel); CFRelease(luma); CFRelease(chroma); CFRelease(held_cache);
+            }];
+            if (deferred) {
+                CVBufferSetAttachment(pixel, CFSTR("dev.eternalmonitor.pyro.command"),
+                                      (__bridge CFTypeRef)command, kCVAttachmentMode_ShouldNotPropagate);
+            } else {
+                [command commit]; [command waitUntilCompleted];
+                require(command.status == MTLCommandBufferStatusCompleted, "Decode command failed");
+            }
             CVBufferSetAttachment(pixel, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
             CVBufferSetAttachment(pixel, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
             CVBufferSetAttachment(pixel, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
@@ -130,6 +149,9 @@ struct StreamDecoder {
         }
     }
 };
+}
+void *em_pyrowave_copy_metal_command_queue(void) {
+    return (__bridge_retained void *)shared_queue();
 }
 int em_pyrowave_is_supported(void) {
     return pyrowave_device_is_supported((__bridge void *)MTLCreateSystemDefaultDevice()) ? 1 : 0;
@@ -145,6 +167,12 @@ void em_pyrowave_stream_decoder_destroy(void *decoder) { delete static_cast<Stre
 void *em_pyrowave_stream_decode(void *decoder, const void *data, size_t size, char *error, size_t error_size) {
     @autoreleasepool { try {
         require(decoder != nullptr, "Missing PyroWave decoder");
-        return static_cast<StreamDecoder *>(decoder)->decode(data, size);
+        return static_cast<StreamDecoder *>(decoder)->decode(data, size, false);
+    } catch (const std::exception &e) { failure(error, error_size, e.what()); return nullptr; } }
+}
+void *em_pyrowave_stream_decode_deferred(void *decoder, const void *data, size_t size, char *error, size_t error_size) {
+    @autoreleasepool { try {
+        require(decoder != nullptr, "Missing PyroWave decoder");
+        return static_cast<StreamDecoder *>(decoder)->decode(data, size, true);
     } catch (const std::exception &e) { failure(error, error_size, e.what()); return nullptr; } }
 }

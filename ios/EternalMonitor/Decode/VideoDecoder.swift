@@ -1,4 +1,6 @@
 import Foundation
+import Metal
+import QuartzCore
 import VideoToolbox
 import CoreMedia
 import os
@@ -300,7 +302,15 @@ final class VideoDecoder {
             inFlight.withLock { $0 += 1 }
             defer { inFlight.withLock { $0 -= 1 } }
             do {
-                let pixel = try pyrowaveDecoder!.decode(packet.data)
+                FrameTrace.log("decode_start", capture: packet.timestampUs, fields: "seq=\(packet.seq) epoch=\(packet.streamEpoch)")
+                let pixel = try pyrowaveDecoder!.decode(packet.data, captureUs: packet.timestampUs)
+                // Pixel buffers can be recycled: never carry an old trace key
+                // into an unsampled or later frame.
+                CVBufferRemoveAttachment(pixel, FrameTrace.key)
+                if FrameTrace.sampled(packet.timestampUs) {
+                    CVBufferSetAttachment(pixel, FrameTrace.key, NSNumber(value: packet.timestampUs), .shouldNotPropagate)
+                    FrameTrace.log("decode_end", capture: packet.timestampUs, fields: "seq=\(packet.seq) epoch=\(packet.streamEpoch) async_gpu=true")
+                }
                 let sequence = Self.submissions.withLock { last in last &+= 1; return last }
                 waitingForSyncSample = false
                 hold.withLock { $0 = nil }

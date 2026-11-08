@@ -94,6 +94,13 @@ impl ConfigSource for SharedConfigSource<'_> {
         let (width, height, software) = {
             let stats = PIPELINE_STATS.lock();
             let (w, h) = stats.capture_resolution;
+            let (w, h) = if self.shared.active_codec.load(Ordering::SeqCst)
+                == eternal_wire::v2::control::CODEC_PYROWAVE
+            {
+                crate::encoder::pyrowave::output_dimensions(w, h)
+            } else {
+                (w, h)
+            };
             (w, h, stats.using_software_fallback)
         };
         eternal_wire::v2::control::StreamConfig {
@@ -503,6 +510,11 @@ pub async fn start_sender(
                 }
 
                 let total_bytes = payload.len();
+                if std::env::var_os("ETERNAL_FRAME_TRACE").is_some() && capture_ts_us % 30 == 0 {
+                    info!(capture_us = capture_ts_us, capture_seq = nal.sequence, frame_seq, stream_epoch,
+                        send_start_us = crate::clock::instant_to_us(send_start), send_done_us = crate::clock::host_now_us(),
+                        send_failed, "Frame trace send");
+                }
                 let latency_ms = send_start.elapsed().as_secs_f64() * 1000.0
                     + nal.encode_duration_us as f64 / 1000.0;
                 PIPELINE_STATS.lock().record_transport(

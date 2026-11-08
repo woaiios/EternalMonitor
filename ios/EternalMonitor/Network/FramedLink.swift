@@ -115,7 +115,7 @@ final class FramedLink: MediaLink {
 
     private func receiveNext() {
         guard let connection else { return }
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { [weak self, weak connection] data, _, complete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { [weak self, weak connection] data, _, complete, error in
             guard let self, let connection, self.connection === connection else { return }
             if let data, !data.isEmpty {
                 do {

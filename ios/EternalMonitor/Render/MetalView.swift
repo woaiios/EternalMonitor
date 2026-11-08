@@ -24,6 +24,10 @@ struct MetalView: UIViewRepresentable {
         // Redraw only when told to — new frame or size change.
         view.isPaused = true
         view.enableSetNeedsDisplay = true
+        if let layer = view.layer as? CAMetalLayer {
+            layer.maximumDrawableCount = 2
+            layer.presentsWithTransaction = false
+        }
         // On-demand drawing ignores this, so it only matters if the view is
         // ever unpaused: never cap the panel (ProMotion runs at 120 Hz).
         view.preferredFramesPerSecond = UIScreen.main.maximumFramesPerSecond
@@ -46,6 +50,7 @@ struct MetalView: UIViewRepresentable {
         // Fit or Fill changed: redraw the held frame now, not at the next one.
         if let renderer = context.coordinator.renderer, renderer.pictureFit != settings.pictureFit {
             renderer.pictureFit = settings.pictureFit
+            renderer.invalidatePicture()
             uiView.setNeedsDisplay()
         }
     }
@@ -58,19 +63,36 @@ struct MetalView: UIViewRepresentable {
         Coordinator()
     }
 
-    final class Coordinator: NSObject, MTKViewDelegate {
+    final class Coordinator: NSObject, MTKViewDelegate, CAMetalDisplayLinkDelegate {
         var renderer: MetalRenderer?
         /// Direct reference to the shared FrameSlot — avoids crossing @MainActor boundary on the render thread.
         var frameSlot: FrameSlot?
 
         private weak var view: MTKView?
         private var memoryWarning: NSObjectProtocol?
+        private var displayLink: CAMetalDisplayLink?
+        private var cadenceLink: CADisplayLink?
         /// Coalesces redraw requests: many decoded frames between two main-loop
         /// turns become one setNeedsDisplay.
         private let redrawPending = OSAllocatedUnfairLock(initialState: false)
 
         func attach(view: MTKView) {
             self.view = view
+            renderer?.onNeedsDraw = { [weak self] in self?.scheduleRedraw() }
+            if ProcessInfo.processInfo.arguments.contains("--manual-metal") {
+                let cadence = CADisplayLink(target: self, selector: #selector(cadenceTick(_:)))
+                cadence.preferredFrameRateRange = CAFrameRateRange(minimum: 120, maximum: 120, preferred: 120)
+                cadence.add(to: .main, forMode: .common)
+                cadenceLink = cadence
+            } else {
+                let displayLink = CAMetalDisplayLink(metalLayer: view.layer as! CAMetalLayer)
+                displayLink.delegate = self
+                displayLink.preferredFrameLatency = 1
+                displayLink.preferredFrameRateRange = CAFrameRateRange(minimum: 120, maximum: 120, preferred: 120)
+                displayLink.add(to: .main, forMode: .common)
+                self.displayLink = displayLink
+                view.enableSetNeedsDisplay = false
+            }
             frameSlot?.onFrameStored = { [weak self] in
                 self?.scheduleRedraw()
             }
@@ -85,6 +107,11 @@ struct MetalView: UIViewRepresentable {
         }
 
         func detach() {
+            displayLink?.invalidate()
+            cadenceLink?.invalidate()
+            cadenceLink = nil
+            displayLink = nil
+            renderer?.onNeedsDraw = nil
             frameSlot?.onFrameStored = nil
             view = nil
             if let memoryWarning { NotificationCenter.default.removeObserver(memoryWarning) }
@@ -102,13 +129,43 @@ struct MetalView: UIViewRepresentable {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.redrawPending.withLock { $0 = false }
-                self.view?.setNeedsDisplay()
+                // Draw the latest picture immediately on the main queue;
+                // UIKit invalidation otherwise waits for another display pass.
+                if self.displayLink == nil { self.view?.draw() }
             }
         }
 
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
             // Redraw the held frame with the letterbox recomputed for the new size.
+            renderer?.invalidatePicture()
             view.setNeedsDisplay()
+        }
+
+        private var tickNumber = 0
+        private let lateMicroseconds: Double = {
+            let spec = ProcessInfo.processInfo.arguments.first { $0.hasPrefix("--metal-late-us=") }
+            return min(7500, max(-2000, spec.flatMap { Double($0.split(separator: "=").last ?? "") } ?? -400))
+        }()
+        @objc private func cadenceTick(_ link: CADisplayLink) {
+            tickNumber += 1
+            if tickNumber % 120 == 0 { FrameTrace.displayPeriod(link.targetTimestamp - link.timestamp) }
+        }
+        func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
+            tickNumber += 1
+            if tickNumber % 120 == 0 { FrameTrace.displayPeriod(update.targetPresentationTimestamp - update.targetTimestamp) }
+            // The callback can arrive a full CPU frame before its deadline.
+            // Latch the newest decoded picture late instead of aging it here.
+            let delay = max(0, update.targetTimestamp + lateMicroseconds / 1_000_000 - CACurrentMediaTime())
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, update] in
+                self?.renderUpdate(update)
+            }
+        }
+
+        private func renderUpdate(_ update: CAMetalDisplayLink.Update) {
+            guard let renderer, let view else { return }
+            renderer.draw(in: view, pixelBuffer: frameSlot?.take(),
+                          providedDrawable: update.drawable, targetTime: update.targetPresentationTimestamp,
+                          deadlineTime: update.targetTimestamp)
         }
 
         func draw(in view: MTKView) {
@@ -168,6 +225,10 @@ final class MetalRenderer {
     private let pipelineState: MTLRenderPipelineState
     private(set) var textureCache: CVMetalTextureCache?
     private var currentFrame: FrameTextures?
+    private var presentationPending = false
+    private var needsPresentation = false
+    var onNeedsDraw: (() -> Void)?
+    func invalidatePicture() { needsPresentation = true }
     /// Read on the main thread, where the paused MTKView draws.
     var pictureFit: PictureFit = .fit
     #if DEBUG
@@ -179,7 +240,7 @@ final class MetalRenderer {
     init(device: MTLDevice, view: MTKView) {
         self.device = device
 
-        guard let queue = device.makeCommandQueue() else {
+        guard let queue = PyroWaveMetal.queue ?? device.makeCommandQueue() else {
             fatalError("Failed to create Metal command queue")
         }
         self.commandQueue = queue
@@ -221,9 +282,10 @@ final class MetalRenderer {
     // The held frame's textures go before the cache that made them.
     deinit { currentFrame = nil }
 
-    func draw(in view: MTKView, pixelBuffer: CVPixelBuffer?) {
+    func draw(in view: MTKView, pixelBuffer: CVPixelBuffer?, providedDrawable: CAMetalDrawable? = nil, targetTime: CFTimeInterval? = nil, deadlineTime: CFTimeInterval? = nil) {
         if let pixelBuffer, let frame = makeFrameTextures(from: pixelBuffer) {
             currentFrame = frame
+            needsPresentation = true
             // Let the cache recycle textures released by completed draws.
             if let cache = textureCache {
                 CVMetalTextureCacheFlush(cache, 0)
@@ -232,9 +294,22 @@ final class MetalRenderer {
 
         // If no frame yet, skip the draw (paused view keeps its clear color).
         guard let frame = currentFrame else { return }
+        // Keep replacing the latest frame while one drawable awaits display.
+        // Never block the main thread in nextDrawable behind older pictures.
+        guard needsPresentation, providedDrawable != nil || !presentationPending else { return }
 
-        guard let drawable = view.currentDrawable,
-              let passDescriptor = view.currentRenderPassDescriptor,
+        let drawable = providedDrawable ?? view.currentDrawable
+        let pass: MTLRenderPassDescriptor?
+        if let providedDrawable {
+            let descriptor = MTLRenderPassDescriptor()
+            descriptor.colorAttachments[0].texture = providedDrawable.texture
+            descriptor.colorAttachments[0].loadAction = .clear
+            descriptor.colorAttachments[0].storeAction = .store
+            descriptor.colorAttachments[0].clearColor = view.clearColor
+            pass = descriptor
+        } else { pass = view.currentRenderPassDescriptor }
+        guard let drawable,
+              let passDescriptor = pass,
               let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) else {
             return
@@ -260,6 +335,28 @@ final class MetalRenderer {
         // Keep the pixel buffer + texture wrappers alive until the GPU is done
         // sampling them, and their cache alive until they are released.
         let inFlight = InFlightFrame(frame, cache: textureCache)
+        if let capture = CVBufferCopyAttachment(frame.pixelBuffer, FrameTrace.key, nil) as? NSNumber {
+            let captureUs = capture.uint64Value
+            FrameTrace.log("render_submit", capture: captureUs,
+                           fields: "deadline_seconds=\(deadlineTime ?? 0) target_seconds=\(targetTime ?? 0) callback_media_seconds=\(CACurrentMediaTime())")
+            commandBuffer.addCompletedHandler { completed in
+                FrameTrace.log("render_gpu_done", capture: captureUs,
+                               fields: "gpu_start_seconds=\(completed.gpuStartTime) gpu_end_seconds=\(completed.gpuEndTime) callback_media_seconds=\(CACurrentMediaTime())")
+            }
+            drawable.addPresentedHandler { presented in
+                FrameTrace.log("presented", capture: captureUs,
+                               fields: "presented_seconds=\(presented.presentedTime) callback_media_seconds=\(CACurrentMediaTime())")
+            }
+        }
+        needsPresentation = false
+        presentationPending = true
+        drawable.addPresentedHandler { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.presentationPending = false
+                if self.needsPresentation { self.onNeedsDraw?() }
+            }
+        }
         #if DEBUG
         let gate = completedHandlerGate
         #endif
@@ -270,8 +367,15 @@ final class MetalRenderer {
             _ = inFlight
         }
 
-        commandBuffer.present(drawable)
-        commandBuffer.commit()
+        if providedDrawable != nil {
+            // CAMetalDisplayLink owns the deadline. Timed present methods
+            // are forbidden for these drawables; commit then present now.
+            commandBuffer.commit()
+            drawable.present()
+        } else {
+            commandBuffer.present(drawable)
+            commandBuffer.commit()
+        }
     }
 
     /// Whether a decoded frame is held for redraws (resize, rotation).

@@ -22,6 +22,8 @@ use crate::vdd_device::DeviceState;
 
 #[cfg(windows)]
 pub mod dxgi;
+#[cfg(windows)]
+pub mod gpu;
 pub mod recovery;
 pub mod second_screen;
 pub mod synthetic;
@@ -119,6 +121,8 @@ pub(crate) fn frame_budget_for(target_fps: u32) -> Duration {
 /// copy left on the capture side.
 #[derive(Debug, Clone)]
 pub struct RawFrame {
+    #[cfg(windows)]
+    pub gpu: Option<Arc<gpu::GpuFrame>>,
     pub frame_number: u64,
     pub timestamp: Instant,
     /// `height` rows of `width * 4` bytes, then [`FRAME_PADDING`] more when

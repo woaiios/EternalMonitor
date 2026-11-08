@@ -151,6 +151,7 @@ fn run_stage(
         let mut data = frame_buffer((width * height * 4) as usize);
         render_synthetic_frame(&mut data, width, height, number);
         producer.publish(RawFrame {
+            gpu: None,
             frame_number: number,
             timestamp: Instant::now(),
             data: Arc::new(data),

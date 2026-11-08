@@ -185,6 +185,7 @@ final class ConnectionManager: ObservableObject {
     /// retaining self (rebuilt each connect).
     private let controlChannelBox = ControlChannelBox()
     private var fpsCounter = FPSCounter()
+    private var lastLagPublishUs: UInt64 = 0
     // Frame measurements are published with the other HUD stats at 4 Hz.
     private var lagMs: Double = 0
     private var lastTarget: (host: String, port: UInt16)?
@@ -487,9 +488,12 @@ final class ConnectionManager: ObservableObject {
                 if Int(self.videoSize.width) != frameWidth || Int(self.videoSize.height) != frameHeight {
                     self.videoSize = CGSize(width: frameWidth, height: frameHeight)
                 }
-                if let offset = self.controlChannelBox.value?.clockSnapshot.withLock({ $0.offsetUs }),
+                let uiNow = ControlChannel.clientNowUs()
+                if uiNow &- self.lastLagPublishUs >= 200_000,
+                   let offset = self.controlChannelBox.value?.clockSnapshot.withLock({ $0.offsetUs }),
                    let lag = Self.latencyMs(captureUs: ts, offsetUs: offset, nowUs: ControlChannel.clientNowUs()) {
                     self.lagMs = lag
+                    self.lastLagPublishUs = uiNow
                 }
             }
         }
@@ -533,6 +537,9 @@ final class ConnectionManager: ObservableObject {
 
         assembler.onFrameAssembled = { [weak self, weak decoder, weak assembler] data, seq, captureTsUs, isKeyframe in
             guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+            let clock = controlChannelBox.value?.clockSnapshot.withLock { $0 }
+            FrameTrace.log("assembled", capture: captureTsUs,
+                           fields: "seq=\(seq) offset_us=\(clock?.offsetUs.map(String.init) ?? "unknown") rtt_us=\(clock?.rttUs.map(String.init) ?? "unknown")")
             self.streamCounters.recordAssembled(bytes: data.count)
             self.streamCounters.recordParsed()
             decoder?.decode(packet: FramePacket(

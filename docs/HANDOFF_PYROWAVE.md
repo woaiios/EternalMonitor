@@ -2,6 +2,42 @@
 
 更新：2026-11-08，Windows 工作目录 `D:\lab\EternalMonitor`。
 
+## 最新延迟优化检查点（2026-11-08 16:55 JST）
+
+本节覆盖下面初次接通记录中的旧状态。用户随后要求以当前游戏场景、全屏 iPad 为基准，尽力将完整链路压到 10ms；最新指令为先 commit，暂停继续调参。
+
+- 已实现 AMD 同适配器 D3D11 共享纹理/时间线 fence → Vulkan PyroWave，避免 CPU 像素读回和 CPU 色彩转换。使用采集适配器 LUID，不能据此承诺 NVIDIA→AMD 也零拷贝。PyroWave 仍为 compute 编码。
+- USB 小分片批量写入，EPW1 独立帧队列只保留最新待发送帧；音频/控制在批次之间继续调度。
+- iPad 解码改为异步提交，与显示共用 Metal command queue 保证依赖；持有像素缓冲直到 GPU 完成，保留同步 benchmark API。CPU decode_end 现在是提交完成，GPU 完成另有真实时间戳，不能混淆。
+- 当前低延迟试验档：游戏/虚拟屏仍为 2388×1668@120Hz，串流视频 GPU 缩放至 **1030×720**，AMD、170Mbps 上限。不是原生画质的同条件提速。
+- 最新 45 秒 CAMetalDisplayLink 样本 68 帧：采集→呈现 p50 **25.513ms** / p95 **32.842ms** / min 14.950ms；采集→GPU 解码完成 **7.839 / 10.982ms**。接收端约 120fps，最近短测 dropped=0。**完整 10ms 尚未达到。**
+- GPU 渲染本身 p50 0.319ms，GPU 完成→呈现 p50 15.433ms；剩余主要瓶颈为客户端显示调度。120Hz 是 8.33ms 一周期，15ms 不是单个刷新周期。手动提交对照 p50 27.455ms / p95 35.497ms，不能归因于 CADisplayLink 单一 API。
+- GPU event 晚锁存实验出现无有效呈现/黑屏风险，**已从提交代码删除**；本机备份 `build/pyrowave/MetalView-late-latch-experiment.swift` 和失败 trace 可供研究，不得作为已验证优化重新默认启用。
+- GPU 采集实验路径尚未额外合成系统硬件鼠标光标；游戏自身画面中的光标不受此限制。未做游戏帧时间对照、温控长测或触摸到光子的外部测量。
+
+复现命令（全部本地 trace，无自动上传；WDA 保持关闭）：
+
+```powershell
+# 正常退出脚本会改变当前 PowerShell 控制台句柄，建议在独立 PowerShell 子进程调用 Stop。
+powershell -ExecutionPolicy Bypass -File scripts/win/Run-PyroWave.ps1 -Stop -Release
+. ./build/pyrowave/cargo-env.ps1
+python scripts/build_pyrowave_bgra.py
+cargo build --release --locked -p eternal-host -j8
+Copy-Item build/pyrowave/native-zig/libpyrowave-shared-1.dll target/release/ -Force
+./scripts/win/Run-PyroWave.ps1 -Release -FrameTrace -GpuCapture -VideoHeight 720 -GpuQueue graphics -Gpu amd -Mbps 170 -Fps 120
+# VideoHeight 0 保留原生尺寸；新开进程才更新 profile。GpuCapture 自动启用 GPU conversion。
+& "$env:APPDATA/npm/ios.exe" launch XTL-UH6S3NYDHH.dev.eternalmonitor.PyroWavePreview --arg=--frame-trace --tunnel-info-port=28100
+python scripts/monitor_frame_trace.py --duration 60 --interval 15 --output build/pyrowave/latency-monitor
+```
+
+监测使用采集时间戳、seq/epoch、四时间戳时钟校准、GPU gpuEndTime 和 drawable.presentedTime，拒绝不完整链路和零呈现时间，报告覆盖率。只代表采集→系统呈现估计，不包含游戏此前渲染、输入、屏幕扫描或像素响应。各阶段 p95 不可相加，USB 写入与接收组装有重叠。采样 capture_us%30==0，有限样本可能存在相位偏差。
+
+证据均在忽略的 `build/pyrowave/`：原始 `latency-game-report.json`（原生尺寸、同步路径，215 帧 p50 54.155ms / p95 72.013ms），`latency-final-amd-graphics/latest.json`、`latency-final-manual-amd/latest.json`。未提交游戏画面、设备日志、凭据或二进制。AMD compute 队列旧样本 `latency-gpu-amd-720/latest.json` 57 帧 p50 24.815ms / p95 30.970ms，不应只挑这一轮当稳定承诺。
+
+扩展 DLL 仍基于下面的同一 upstream pin，增加仓库中的 `host/native/pyrowave_bgra.inc`；构建脚本只修改忽略的 build 快照，不改 D:/lab/pyrowave。须启用 GRANITE_VULKAN_SYSTEM_HANDLES；扩展 encode 符号为 `em_pyrowave_encode_d3d11_v2`，不可混用旧四参数 ABI。当前 DLL SHA256：`56343DB87D76DC7AB68A21622346A875D54BF75894F98AA2594B82762C025D15`。
+
+验证：Python 9 tests；Rust lib 结果见 `build/pyrowave/latency-final-tests.log`；AMD 共享纹理色条/重复帧 fence 真 GPU 测试（ignored，显式执行）已通过，见 `latency-gpu-color-test.log`；xtool release 构建见 `latency-clean-ios-build.log`。xtool 并未运行整个 iOS XCTest。下一步应单独制作最小原生显示基准，比较 CAMetalDisplayLink / 直接 CAMetalLayer 的 deadline、实际 presentedTime 与显示周期，避免继续盲调编码。
+
 ## 用户目标与当前结论
 
 用户要求先检查后门、关闭自动诊断，再让 NVIDIA 负责游戏，AMD 核显承担串流编码；希望采用本机 `D:\lab\pyrowave` 的高带宽、低压缩等待实现。最新决定是**先跑通，后优化**，并授权 commit、push 和留下本交接文件。
@@ -123,7 +159,7 @@ Windows Rust 使用 LLVM-MinGW 时必须 `RUSTFLAGS='-C link-self-contained=yes'
 & ./build/pyrowave/tools/python/cmake/data/bin/cmake.exe --build build/pyrowave/native-zig --target pyrowave-shared -j8
 ```
 
-当前 DLL SHA256：`A33681A102DA98752E6DD88263EB4D3A02BD3D9A0C7B8ABC69C2F6961510F67A`。应用不会从网络自动下载 DLL。iPad vendor 代码随仓库保存，并在 `vendor/UPSTREAM.md` 标注原始来源。
+初次接通 DLL SHA256（现已被上述扩展替代）：`A33681A102DA98752E6DD88263EB4D3A02BD3D9A0C7B8ABC69C2F6961510F67A`。应用不会从网络自动下载 DLL。iPad vendor 代码随仓库保存，并在 `vendor/UPSTREAM.md` 标注原始来源。
 
 ## 自动诊断与安全审查遗留
 

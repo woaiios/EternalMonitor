@@ -227,7 +227,7 @@ pub fn run_capture_loop(
     // --- Create D3D11 device on the selected adapter ---
     let device = {
         let _call = super::second_screen::driver_call(&shared, generation);
-        create_device(adapter, super::hold_watchdog(&shared, generation))??
+        create_device(adapter.clone(), super::hold_watchdog(&shared, generation))??
     };
     info!("D3D11 device created");
 
@@ -297,6 +297,12 @@ pub fn run_capture_loop(
     // The last published frame, shared for keepalive resends without a copy.
     // Starts as a black frame so a static screen still yields a startup IDR.
     let mut last_frame: Arc<Vec<u8>> = Arc::new(frame_buffer(frame_bytes));
+    let mut gpu_pool: Option<super::gpu::Pool> = None;
+    let mut last_gpu: Option<Arc<super::gpu::GpuFrame>> = None;
+    let gpu_luid = unsafe { adapter.GetDesc1()? }.AdapterLuid;
+    let mut gpu_luid_bytes = [0u8; 8];
+    gpu_luid_bytes[..4].copy_from_slice(&gpu_luid.LowPart.to_le_bytes());
+    gpu_luid_bytes[4..].copy_from_slice(&gpu_luid.HighPart.to_le_bytes());
 
     // --- Capture loop state ---
     let mut frame_timestamps: VecDeque<Instant> = VecDeque::with_capacity(FPS_WINDOW + 1);
@@ -444,6 +450,84 @@ pub fn run_capture_loop(
                     }
                     continue;
                 }
+                let gpu_client = super::gpu::requested()
+                    && std::env::var("ETERNAL_PYROWAVE").as_deref() == Ok("1")
+                    && {
+                        let session = shared.session.lock();
+                        session.peer().is_some_and(|peer| {
+                            matches!(peer.link, crate::transport::link::LinkId::Usb { .. })
+                        }) && session.client_info().is_some_and(|client| {
+                            client.decoder_caps & eternal_wire::v2::control::CAP_DECODE_PYROWAVE
+                                != 0
+                        })
+                    };
+                if gpu_client {
+                    let copied =
+                        (|| -> windows::core::Result<Option<Arc<super::gpu::GpuFrame>>> {
+                            if gpu_pool
+                                .as_ref()
+                                .is_none_or(|p| p.dimensions != (tex_width, tex_height))
+                            {
+                                gpu_pool = Some(super::gpu::Pool::new(
+                                    &device,
+                                    &device_context,
+                                    gpu_luid_bytes,
+                                    tex_width,
+                                    tex_height,
+                                )?);
+                            }
+                            let texture: ID3D11Texture2D = desktop_resource
+                                .as_ref()
+                                .expect("acquired resource")
+                                .cast()?;
+                            gpu_pool.as_mut().unwrap().copy(&texture)
+                        })();
+                    match copied {
+                        Ok(frame) => {
+                            unsafe {
+                                dupl.ReleaseFrame()?;
+                            }
+                            seen_image = true;
+                            super::second_screen::note_image(&shared, generation);
+                            if let Some(frame) = frame {
+                                if idle.on_frame(client_connected(&shared), now)
+                                    == FrameUse::Publish
+                                {
+                                    if std::env::var_os("ETERNAL_FRAME_TRACE").is_some()
+                                        && crate::clock::instant_to_us(now) % 30 == 0
+                                    {
+                                        info!(
+                                            capture_us = crate::clock::instant_to_us(now),
+                                            frame = *frame_number,
+                                            readback_done_us = crate::clock::host_now_us(),
+                                            gpu_capture = true,
+                                            "Frame trace capture"
+                                        );
+                                    }
+                                    PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
+                                    heartbeat(&shared.hb_capture_frame_ms);
+                                    slot.publish(RawFrame {
+                                        gpu: Some(frame.clone()),
+                                        frame_number: *frame_number,
+                                        timestamp: now,
+                                        data: Arc::new(Vec::new()),
+                                        width: tex_width,
+                                        height: tex_height,
+                                    });
+                                    last_gpu = Some(frame);
+                                    last_send = now;
+                                }
+                            } else {
+                                heartbeat(&shared.hb_capture_frame_ms);
+                            }
+                            continue;
+                        }
+                        Err(error) => {
+                            warn!(%error,"D3D11 shared capture unavailable; keeping CPU readback");
+                            super::gpu::disable();
+                        }
+                    }
+                }
                 let frame_data = read_back_image(&shared, generation, &mut seen_image, || {
                     windows::core::Result::Ok(if let Some(ref resource) = desktop_resource {
                         match resource.cast::<ID3D11Texture2D>() {
@@ -529,10 +613,21 @@ pub fn run_capture_loop(
 
                 if let Some(data) = frame_data {
                     if idle.on_frame(client_connected(&shared), now) == FrameUse::Publish {
+                        if std::env::var_os("ETERNAL_FRAME_TRACE").is_some()
+                            && crate::clock::instant_to_us(now) % 30 == 0
+                        {
+                            tracing::info!(
+                                capture_us = crate::clock::instant_to_us(now),
+                                frame = *frame_number,
+                                readback_done_us = crate::clock::host_now_us(),
+                                "Frame trace capture"
+                            );
+                        }
                         PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
                         heartbeat(&shared.hb_capture_frame_ms);
 
                         slot.publish(RawFrame {
+                            gpu: None,
                             frame_number: *frame_number,
                             timestamp: now,
                             data: Arc::clone(&data),
@@ -572,14 +667,30 @@ pub fn run_capture_loop(
                     )
                     && keepalive_allowed(seen_image, second_screen)
                 {
-                    resend_last_frame(
-                        slot,
-                        &shared,
-                        frame_number,
-                        &mut last_send,
-                        &last_frame,
-                        (tex_width, tex_height),
-                    );
+                    if super::gpu::requested() && last_gpu.is_some() {
+                        *frame_number += 1;
+                        let now = Instant::now();
+                        PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
+                        heartbeat(&shared.hb_capture_frame_ms);
+                        slot.publish(RawFrame {
+                            gpu: last_gpu.clone(),
+                            frame_number: *frame_number,
+                            timestamp: now,
+                            data: Arc::new(Vec::new()),
+                            width: tex_width,
+                            height: tex_height,
+                        });
+                        last_send = now;
+                    } else {
+                        resend_last_frame(
+                            slot,
+                            &shared,
+                            frame_number,
+                            &mut last_send,
+                            &last_frame,
+                            (tex_width, tex_height),
+                        );
+                    }
                 } else if !client_connected(&shared)
                     && last_send.elapsed() >= Duration::from_secs(2)
                 {
@@ -831,6 +942,7 @@ fn resend_last_frame(
     PIPELINE_STATS.lock().record_capture(width, height);
     heartbeat(&shared.hb_capture_frame_ms);
     slot.publish(RawFrame {
+        gpu: None,
         frame_number: *frame_number,
         timestamp: now,
         data: Arc::clone(last_frame),

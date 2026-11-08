@@ -16,12 +16,34 @@ pub(crate) fn bitrate_bps() -> u32 {
         * 1_000_000
 }
 
+pub(crate) fn output_dimensions(width: u32, height: u32) -> (u32, u32) {
+    if std::env::var("ETERNAL_PYROWAVE_BGRA").as_deref() != Ok("1") {
+        return (width, height);
+    }
+    let target = std::env::var("ETERNAL_PYROWAVE_HEIGHT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok());
+    if let Some(h) = target.filter(|h| (64..=2160).contains(h) && *h < height && h % 2 == 0) {
+        let w = (u64::from(width) * u64::from(h) / u64::from(height)) as u32 & !1;
+        if (64..=4096).contains(&w) {
+            return (w, h);
+        }
+    }
+    (width, height)
+}
+
 #[cfg(windows)]
 pub(super) use native::Encoder;
 #[cfg(not(windows))]
 pub(super) struct Encoder;
 #[cfg(not(windows))]
 impl Encoder {
+    pub fn from_frame(raw: &RawFrame) -> Result<Self, String> {
+        Self::new(raw.width, raw.height)
+    }
+    pub fn matches(&self, raw: &RawFrame) -> bool {
+        self.dimensions() == (raw.width, raw.height)
+    }
     pub fn new(_: u32, _: u32) -> Result<Self, String> {
         Err("PyroWave encoding requires Windows".into())
     }
@@ -41,6 +63,8 @@ mod native {
     use super::*;
     use std::{ffi::c_void, os::windows::ffi::OsStrExt};
     type Handle = *mut c_void;
+    type EncodeBgra =
+        unsafe extern "C" fn(Handle, *const c_void, usize, i32, i32, usize, *const Rate) -> i32;
     #[repr(C)]
     struct EncoderInfo {
         device: Handle,
@@ -102,6 +126,10 @@ mod native {
         encoder_create: unsafe extern "C" fn(*const EncoderInfo, *mut Handle) -> i32,
         encoder_destroy: unsafe extern "C" fn(Handle),
         encode: unsafe extern "C" fn(Handle, *const CpuBuffer, *const Rate) -> i32,
+        encode_bgra: Option<EncodeBgra>,
+        import_d3d: Option<unsafe extern "C" fn(Handle, Handle, Handle, u32, u32) -> Handle>,
+        destroy_d3d: Option<unsafe extern "C" fn(Handle)>,
+        encode_d3d: Option<unsafe extern "C" fn(Handle, Handle, u64, u64, *const Rate) -> i32>,
         count: unsafe extern "C" fn(Handle, usize, *mut usize) -> i32,
         packetize:
             unsafe extern "C" fn(Handle, *mut Packet, usize, *mut usize, Handle, usize) -> i32,
@@ -137,6 +165,10 @@ mod native {
                     encoder_create: library.function(b"pyrowave_encoder_create\0")?,
                     encoder_destroy: library.function(b"pyrowave_encoder_destroy\0")?,
                     encode: library.function(b"pyrowave_encoder_encode_cpu\0")?,
+                    encode_bgra: library.function(b"em_pyrowave_encoder_encode_bgra\0").ok(),
+                    import_d3d: library.function(b"em_pyrowave_import_d3d11\0").ok(),
+                    destroy_d3d: library.function(b"em_pyrowave_destroy_d3d11\0").ok(),
+                    encode_d3d: library.function(b"em_pyrowave_encode_d3d11_v2\0").ok(),
                     count: library.function(b"pyrowave_encoder_compute_num_packets\0")?,
                     packetize: library.function(b"pyrowave_encoder_packetize\0")?,
                     _library: library,
@@ -378,12 +410,23 @@ mod native {
         encoder: Handle,
         width: u32,
         height: u32,
-        convert: Sliced,
+        input_width: u32,
+        input_height: u32,
+        convert: Option<Sliced>,
+        bgra: Option<std::sync::Arc<Vec<u8>>>,
+        gpu_luid: Option<[u8; 8]>,
+        gpu: Option<std::sync::Arc<crate::capture::gpu::GpuFrame>>,
+        imports: Vec<(usize, Handle)>,
         output: Vec<u8>,
     }
     impl Drop for Encoder {
         fn drop(&mut self) {
             unsafe {
+                if let Some(destroy) = self.api.destroy_d3d {
+                    for (_, source) in self.imports.drain(..) {
+                        destroy(source);
+                    }
+                }
                 if !self.encoder.is_null() {
                     (self.api.encoder_destroy)(self.encoder);
                 }
@@ -394,10 +437,13 @@ mod native {
         }
     }
     impl Encoder {
-        pub fn dimensions(&self) -> (u32, u32) {
-            (self.width, self.height)
+        pub fn matches(&self, raw: &RawFrame) -> bool {
+            (self.input_width, self.input_height) == (raw.width, raw.height)
+                && self.gpu_luid == raw.gpu.as_ref().map(|f| f.resource.luid)
         }
-        pub fn new(width: u32, height: u32) -> Result<Self, String> {
+        pub fn from_frame(raw: &RawFrame) -> Result<Self, String> {
+            let (width, height) = (raw.width, raw.height);
+            let gpu_luid = raw.gpu.as_ref().map(|f| f.resource.luid);
             if !(64..=4096).contains(&width)
                 || !(64..=4096).contains(&height)
                 || width % 2 != 0
@@ -405,16 +451,48 @@ mod native {
             {
                 return Err("PyroWave requires even dimensions between 64 and 4096".into());
             }
-            let convert = Sliced::new(width, height, convert_threads())?;
+            let (input_width, input_height) = (width, height);
+            let (width, height) = output_dimensions(width, height);
+            let api = Api::load()?;
+            let gpu_convert = std::env::var("ETERNAL_PYROWAVE_BGRA").as_deref() == Ok("1");
+            if gpu_convert && api.encode_bgra.is_none() {
+                return Err("PyroWave DLL lacks the optional BGRA extension".into());
+            }
+            if gpu_luid.is_some()
+                && (api.import_d3d.is_none()
+                    || api.encode_d3d.is_none()
+                    || api.destroy_d3d.is_none())
+            {
+                return Err("PyroWave DLL lacks D3D11 interop extension".into());
+            }
+            let convert = if gpu_convert || gpu_luid.is_some() {
+                None
+            } else {
+                Some(Sliced::new(width, height, convert_threads())?)
+            };
             let mut state = Self {
-                api: Api::load()?,
+                api,
                 device: std::ptr::null_mut(),
                 encoder: std::ptr::null_mut(),
                 width,
                 height,
+                input_width,
+                input_height,
                 convert,
+                bgra: None,
+                gpu_luid,
+                gpu: None,
+                imports: Vec::new(),
                 output: Vec::new(),
             };
+            tracing::info!(
+                input_width,
+                input_height,
+                width,
+                height,
+                gpu_convert,
+                "PyroWave conversion path"
+            );
             let vendor = match std::env::var("ETERNAL_PYROWAVE_GPU").as_deref() {
                 Ok("amd") => 0x1002,
                 Ok("nvidia") => 0x10de,
@@ -423,18 +501,26 @@ mod native {
             unsafe {
                 checked(
                     (state.api.create)(
-                        vendor,
+                        if gpu_luid.is_some() { 0 } else { vendor },
                         0,
                         std::ptr::null_mut(),
                         std::ptr::null_mut(),
-                        std::ptr::null_mut(),
+                        gpu_luid
+                            .as_ref()
+                            .map_or(std::ptr::null_mut(), |luid| luid.as_ptr() as Handle),
                         256,
                         &mut state.device,
                     ),
                     "device create",
                 )?;
+                let queue_type =
+                    if std::env::var("ETERNAL_PYROWAVE_QUEUE").as_deref() == Ok("graphics") {
+                        1
+                    } else {
+                        2
+                    };
                 checked(
-                    (state.api.queue)(state.device, 2),
+                    (state.api.queue)(state.device, queue_type),
                     "async compute queue selection",
                 )?;
                 let info = EncoderInfo {
@@ -456,18 +542,18 @@ mod native {
         ///
         /// [`encode`]: Self::encode
         pub fn convert(&mut self, raw: &RawFrame) -> Result<(), String> {
-            self.convert.convert(&raw.data)
+            if let Some(gpu) = raw.gpu.as_ref() {
+                self.gpu = Some(gpu.clone());
+                return Ok(());
+            }
+            if let Some(convert) = self.convert.as_mut() {
+                convert.convert(&raw.data)
+            } else {
+                self.bgra = Some(std::sync::Arc::clone(&raw.data));
+                Ok(())
+            }
         }
         pub fn encode(&mut self, bitrate: u32, fps: u32) -> Result<Vec<u8>, String> {
-            let frame = self.convert.frame();
-            let input = CpuBuffer {
-                data: std::array::from_fn(|p| frame.data(p).as_ptr() as Handle),
-                strides: std::array::from_fn(|p| frame.stride(p)),
-                sizes: std::array::from_fn(|p| frame.data(p).len()),
-                width: self.width as i32,
-                height: self.height as i32,
-                format: 1,
-            };
             // Leave room for framing in the existing 1 MiB USB queue, even
             // at the smallest supported media datagram size.
             let budget =
@@ -477,8 +563,95 @@ mod native {
             };
             self.output.resize(budget, 0);
             let mut count = 0;
+            // A shared texture cannot return to the capture pool until the
+            // metadata/readback fence below has completed, not just submit.
+            let gpu_frame = self.gpu.take();
             unsafe {
-                checked((self.api.encode)(self.encoder, &input, &rate), "encode")?;
+                if let Some(gpu) = gpu_frame.as_ref() {
+                    use windows::Win32::Foundation::{
+                        DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE,
+                    };
+                    use windows::Win32::System::Threading::GetCurrentProcess;
+                    let key =
+                        crate::capture::gpu::raw_handle(&gpu.resource.texture_handle).0 as usize;
+                    let source = if let Some((_, source)) =
+                        self.imports.iter().find(|(id, _)| *id == key)
+                    {
+                        *source
+                    } else {
+                        let duplicate = |handle: HANDLE| -> Result<Handle, String> {
+                            let mut value = HANDLE::default();
+                            DuplicateHandle(
+                                GetCurrentProcess(),
+                                handle,
+                                GetCurrentProcess(),
+                                &mut value,
+                                0,
+                                false,
+                                DUPLICATE_SAME_ACCESS,
+                            )
+                            .map_err(|e| e.to_string())?;
+                            Ok(value.0)
+                        };
+                        let texture = duplicate(crate::capture::gpu::raw_handle(
+                            &gpu.resource.texture_handle,
+                        ))?;
+                        let fence =
+                            duplicate(crate::capture::gpu::raw_handle(&gpu.resource.fence_handle))?;
+                        let source = (self.api.import_d3d.ok_or("Missing D3D11 import")?)(
+                            self.encoder,
+                            texture,
+                            fence,
+                            gpu.resource.width,
+                            gpu.resource.height,
+                        );
+                        if source.is_null() {
+                            return Err("D3D11 texture/fence import failed".into());
+                        }
+                        self.imports.push((key, source));
+                        source
+                    };
+                    let released = gpu.resource.reserve_release();
+                    checked(
+                        (self.api.encode_d3d.ok_or("Missing D3D11 encode")?)(
+                            self.encoder,
+                            source,
+                            gpu.value,
+                            released,
+                            &rate,
+                        ),
+                        "D3D11 GPU encode",
+                    )?;
+                    gpu.resource.committed_release(released);
+                } else if let Some(bgra) = self.bgra.take() {
+                    checked(
+                        (self.api.encode_bgra.ok_or("Missing BGRA encoder")?)(
+                            self.encoder,
+                            bgra.as_ptr().cast(),
+                            bgra.len(),
+                            self.input_width as i32,
+                            self.input_height as i32,
+                            self.input_width as usize * 4,
+                            &rate,
+                        ),
+                        "BGRA upload and GPU conversion/encode",
+                    )?;
+                } else {
+                    let frame = self
+                        .convert
+                        .as_ref()
+                        .ok_or("Missing encoder input")?
+                        .frame();
+                    let input = CpuBuffer {
+                        data: std::array::from_fn(|p| frame.data(p).as_ptr() as Handle),
+                        strides: std::array::from_fn(|p| frame.stride(p)),
+                        sizes: std::array::from_fn(|p| frame.data(p).len()),
+                        width: self.width as i32,
+                        height: self.height as i32,
+                        format: 1,
+                    };
+                    checked((self.api.encode)(self.encoder, &input, &rate), "encode")?;
+                }
                 checked(
                     (self.api.count)(self.encoder, budget, &mut count),
                     "packet count",
@@ -532,6 +705,188 @@ mod native {
         fn pattern(bytes: &mut [u8], row_bytes: usize) {
             for (index, byte) in bytes.iter_mut().enumerate() {
                 *byte = (index * 131 + index / row_bytes * 29) as u8;
+            }
+        }
+
+        #[test]
+        #[ignore = "requires local AMD D3D11/Vulkan hardware and the optional DLL beside the test executable"]
+        fn shared_d3d_capture_colorbars_match_video_range() {
+            use windows::Win32::Foundation::HMODULE;
+            use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+            use windows::Win32::Graphics::Direct3D11::*;
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+            };
+            use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+            unsafe {
+                let factory: IDXGIFactory1 = CreateDXGIFactory1().unwrap();
+                let adapter = (0..16)
+                    .find_map(|i| {
+                        factory
+                            .EnumAdapters1(i)
+                            .ok()
+                            .filter(|a| a.GetDesc1().is_ok_and(|d| d.VendorId == 0x1002))
+                    })
+                    .unwrap();
+                let id = adapter.GetDesc1().unwrap().AdapterLuid;
+                let mut luid = [0u8; 8];
+                luid[..4].copy_from_slice(&id.LowPart.to_le_bytes());
+                luid[4..].copy_from_slice(&id.HighPart.to_le_bytes());
+                let (mut device, mut context) = (None, None);
+                D3D11CreateDevice(
+                    &adapter,
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )
+                .unwrap();
+                let (device, context) = (device.unwrap(), context.unwrap());
+                let (width, height) = (512u32, 256u32);
+                let colors = [
+                    [0u8, 0, 0],
+                    [255, 255, 255],
+                    [255, 0, 0],
+                    [0, 255, 0],
+                    [0, 0, 255],
+                    [128, 128, 128],
+                    [0, 255, 255],
+                    [255, 0, 255],
+                ];
+                let pixels: Vec<u8> = (0..height)
+                    .flat_map(|_| {
+                        (0..width).flat_map(|x| {
+                            let [r, g, b] = colors[x as usize / 64];
+                            [b, g, r, 255]
+                        })
+                    })
+                    .collect();
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: width,
+                    Height: height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    ..Default::default()
+                };
+                let initial = D3D11_SUBRESOURCE_DATA {
+                    pSysMem: pixels.as_ptr().cast(),
+                    SysMemPitch: width * 4,
+                    SysMemSlicePitch: 0,
+                };
+                let mut texture = None;
+                device
+                    .CreateTexture2D(&desc, Some(&initial), Some(&mut texture))
+                    .unwrap();
+                let mut pool =
+                    crate::capture::gpu::Pool::new(&device, &context, luid, width, height).unwrap();
+                let raw = RawFrame {
+                    gpu: pool.copy(&texture.unwrap()).unwrap(),
+                    frame_number: 1,
+                    timestamp: std::time::Instant::now(),
+                    data: std::sync::Arc::new(Vec::new()),
+                    width,
+                    height,
+                };
+                let mut encoder = Encoder::from_frame(&raw).unwrap();
+                encoder.convert(&raw).unwrap();
+                let bytes = encoder.encode(350_000_000, 120).unwrap();
+                // Idle keepalives re-encode the same surface. Timeline values
+                // must still advance; re-signaling the old value is invalid.
+                for _ in 0..3 {
+                    let fence = &raw.gpu.as_ref().unwrap().resource.fence;
+                    let previous = fence.GetCompletedValue();
+                    encoder.convert(&raw).unwrap();
+                    encoder.encode(350_000_000, 120).unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    while fence.GetCompletedValue() <= previous
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    assert!(
+                        fence.GetCompletedValue() > previous,
+                        "replayed frame did not release its timeline"
+                    );
+                }
+                let create: unsafe extern "C" fn(*const EncoderInfo, *mut Handle) -> i32 = encoder
+                    .api
+                    ._library
+                    .function(b"pyrowave_decoder_create\0")
+                    .unwrap();
+                let push: unsafe extern "C" fn(Handle, *const u8, usize) -> i32 = encoder
+                    .api
+                    ._library
+                    .function(b"pyrowave_decoder_push_packet\0")
+                    .unwrap();
+                let decode: unsafe extern "C" fn(Handle, *const CpuBuffer) -> i32 = encoder
+                    .api
+                    ._library
+                    .function(b"pyrowave_decoder_decode_cpu_buffer_synchronous\0")
+                    .unwrap();
+                let destroy: unsafe extern "C" fn(Handle) = encoder
+                    .api
+                    ._library
+                    .function(b"pyrowave_decoder_destroy\0")
+                    .unwrap();
+                let mut decoder = std::ptr::null_mut();
+                checked(
+                    create(
+                        &EncoderInfo {
+                            device: encoder.device,
+                            width: width as i32,
+                            height: height as i32,
+                            chroma: 0,
+                        },
+                        &mut decoder,
+                    ),
+                    "test decoder",
+                )
+                .unwrap();
+                let mut at = 16;
+                while at < bytes.len() {
+                    let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+                    at += 4;
+                    checked(push(decoder, bytes[at..].as_ptr(), len), "test parse").unwrap();
+                    at += len;
+                }
+                let mut frame = ffmpeg_next::frame::Video::new(
+                    ffmpeg_next::format::Pixel::YUV420P,
+                    width,
+                    height,
+                );
+                let output = CpuBuffer {
+                    data: std::array::from_fn(|p| frame.data_mut(p).as_mut_ptr().cast()),
+                    strides: std::array::from_fn(|p| frame.stride(p)),
+                    sizes: std::array::from_fn(|p| frame.data(p).len()),
+                    width: width as i32,
+                    height: height as i32,
+                    format: 1,
+                };
+                let result = decode(decoder, &output);
+                destroy(decoder);
+                checked(result, "test readback").unwrap();
+                for (i, expected) in [16u8, 235, 63, 173, 32, 126, 188, 78]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let measured =
+                        frame.data(0)[height as usize / 2 * frame.stride(0) + i * 64 + 32];
+                    assert!(
+                        measured.abs_diff(expected) <= 3,
+                        "bar {i}: {measured} expected {expected}"
+                    );
+                }
             }
         }
 
@@ -600,8 +955,11 @@ mod native {
                 )
                 .unwrap()
                 .unwrap();
-                let mut whole =
-                    ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
+                let mut whole = ffmpeg_next::frame::Video::new(
+                    ffmpeg_next::format::Pixel::YUV420P,
+                    width,
+                    height,
+                );
                 crate::encoder::input::convert_packed_bgra(&mut scaler, &rows, &mut whole).unwrap();
                 for wanted in [1usize, 3, 8] {
                     let mut sliced = Sliced::new(width, height, wanted).unwrap();
