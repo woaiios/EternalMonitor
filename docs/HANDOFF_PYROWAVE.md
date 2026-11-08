@@ -2,6 +2,26 @@
 
 更新：2026-11-08，Windows 工作目录 `D:\lab\EternalMonitor`。
 
+## 当前运行档：原生分辨率串流（2026-11-08 17:15 JST）
+
+用户要求把传输视频恢复为 **2388×1668**，已执行；本节覆盖下方 720 高度试验档的运行状态。保持 GPU capture / GPU conversion、AMD capture LUID、graphics queue、170Mbps 上限、请求 120fps、USB batch 64，FrameTrace 显式开启。没有改 iPad 默认渲染调度，没有更改画质算法，没有启动 WDA。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/win/Run-PyroWave.ps1 -Stop -Release
+$env:ETERNAL_USB_BATCH_DGRAMS='64'
+./scripts/win/Run-PyroWave.ps1 -Release -FrameTrace -GpuCapture -VideoHeight 0 -GpuQueue graphics -Gpu amd -Mbps 170 -Fps 120
+```
+
+日志已确认 input_width=2388 input_height=1668 width=2388 height=1668。60 秒短测中有静止/低变化时段；完整呈现链路有效样本 33，不能据此承诺连续游戏 120fps 长期稳定。活动时段观察到约 120fps，接收报告 dropped=0、decode_depth=0。
+
+- AMD encode_total：p50 6.927ms / p95 8.873ms。
+- 首分片接收→组装完成：1.213 / 2.479ms。
+- iPad GPU decode：2.000 / 2.398ms（生产解码路径，区别于更早合成 benchmark）。
+- 采集→GPU 解码完成：14.188 / 17.860ms。
+- 采集→系统呈现：28.570 / 39.517ms。
+
+证据：忽略的 build/pyrowave/latency-native-amd-gpu-170/latest.json 及 host/ipad snapshots；新运行 profile 位于 build/pyrowave/running-host.json，video_height=0。170Mbps 与 720 档保持一致用于对照，不代表原生画质的最佳码率。原生比 720 增加了编码与解码耗时，目前继续保留原生分辨率供用户观察；不要自动退回 720。
+
 ## 原生显示基线补测（2026-11-08）
 
 用户追问原生 iOS 是否真的需要约 15ms 后，新增独立 UIKit + Metal 基准，真机数据见 [NATIVE_PRESENT_BENCHMARK.md](NATIVE_PRESENT_BENCHMARK.md)。确认原生立即提交也能在约 120fps 时测到 GPU完成→呈现 p50 15.64ms；CAMetalDisplayLink 晚提交的保守档降到 9.20ms / p95 9.94ms，激进档 7.85ms / p95 8.01ms 但有 3.86% 未呈现帧。刷新间隔 8.3367ms 与单帧等待不能混为一谈。
