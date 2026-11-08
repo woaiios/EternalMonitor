@@ -175,6 +175,12 @@ struct DisplayView: View {
                 separator
                 stat(connectionManager.stats.e2eMs.map { String(format: "%.0f", $0) } ?? "–", unit: "ms")
                 separator
+                if let config = connectionManager.hostStreamConfig {
+                    Text(config.codecName)
+                        .font(.app(13, .medium, relativeTo: .footnote))
+                        .foregroundStyle(Theme.text)
+                    separator
+                }
                 Text(transportName)
                     .font(.app(13, .medium, relativeTo: .footnote))
                     .foregroundStyle(Theme.text)
@@ -205,8 +211,9 @@ struct DisplayView: View {
     private var hudAccessibilitySummary: String {
         let latency = connectionManager.stats.e2eMs.map { String(format: "%.0f milliseconds", $0) }
             ?? "unknown latency"
+        let codec = connectionManager.hostStreamConfig?.codecName ?? "unknown video format"
         return "Stream statistics: \(Int(connectionManager.fps)) frames per second, "
-            + "\(latency), \(connectionManager.transportMode), \(connectionManager.stats.bars) of 4 signal bars, "
+            + "\(latency), \(codec), \(connectionManager.transportMode), \(connectionManager.stats.bars) of 4 signal bars, "
             + (audioPlaying ? "PC audio playing" : "PC audio muted or unavailable")
     }
 

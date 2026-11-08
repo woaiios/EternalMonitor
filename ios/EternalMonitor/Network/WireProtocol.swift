@@ -213,9 +213,10 @@ struct StreamConfig: Equatable {
     static let codecPyroWave: UInt8 = 2
     var codecName: String {
         switch codec {
+        case Self.codecH264: return "H.264"
         case Self.codecHEVC: return "HEVC (H.265)"
         case Self.codecPyroWave: return "PyroWave"
-        default: return "H.264"
+        default: return "Unknown"
         }
     }
     static let flagSoftwareEncoder: UInt8 = 1 << 0

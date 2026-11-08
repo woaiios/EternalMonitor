@@ -140,6 +140,9 @@ fn run_encode_loop(
     let mut bitrate_pacer = BitratePacer::default();
     let mut pyrowave_encoder: Option<pyrowave::Encoder> = None;
     let mut pyrowave_failed = false;
+    // A new pipeline resets its statistics even when the shared codec still
+    // says PyroWave from the previous generation.
+    let mut pyrowave_reported = false;
 
     // Guarantee the very first frame of every pipeline is an IDR for all encoders, so the
     // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
@@ -217,7 +220,7 @@ fn run_encode_loop(
             match result {
                 Ok(data) => {
                     let encode_us = start.elapsed().as_micros();
-                    if shared.active_codec.load(Ordering::SeqCst)
+                    if !pyrowave_reported || shared.active_codec.load(Ordering::SeqCst)
                         != eternal_wire::v2::control::CODEC_PYROWAVE
                     {
                         info!(
@@ -226,6 +229,7 @@ fn run_encode_loop(
                         );
                         note_encoder_opened(&shared, "pyrowave");
                         PIPELINE_STATS.lock().set_software_fallback(false);
+                        pyrowave_reported = true;
                     }
                     PIPELINE_STATS.lock().record_encode(
                         encode_us,
@@ -259,6 +263,7 @@ fn run_encode_loop(
             // used by a reconnected or Wi-Fi client. Reopen at a fresh IDR.
             encoder_state = None;
             pyrowave_encoder = None;
+            pyrowave_reported = false;
             shared.force_next_idr.store(true, Ordering::SeqCst);
             note_encoder_opened(&shared, &encoder_name);
         }

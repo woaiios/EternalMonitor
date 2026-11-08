@@ -1282,6 +1282,10 @@ pub(crate) trait Driver {
     /// the displays before it.
     fn prepare(&self, outputs: &[OutputInfo]);
     fn set_enabled(&self, enabled: bool) -> bool;
+    /// Try to add the driver's inactive monitor without changing other targets.
+    fn attach_inactive(&self) -> bool {
+        false
+    }
     /// Turn the display on. On failure, what the Enable task found wrong
     /// with the device, or why it could not say.
     fn enable(&self) -> Result<(), EnableReport> {
@@ -1407,10 +1411,22 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
         return;
     }
     let waiting_since = driver.now();
+    let mut next_attach = waiting_since + Duration::from_secs(1);
+    let mut attach_requested = false;
     let result = wait_for_virtual_output(
         &before,
         timeout,
-        || selected().then(|| driver.outputs()),
+        || {
+            if !selected() {
+                return None;
+            }
+            let outputs = driver.outputs();
+            if !attach_requested && driver.now() >= next_attach {
+                attach_requested = driver.attach_inactive();
+                next_attach = driver.now() + Duration::from_secs(2);
+            }
+            Some(outputs)
+        },
         || driver.now(),
         |duration| driver.sleep(duration),
     );
@@ -1582,6 +1598,15 @@ impl Driver for WindowsDriver<'_> {
         crate::vdd::enable(|| {})
     }
 
+    fn attach_inactive(&self) -> bool {
+        crate::vdd_device::attach_inactive_display(
+            self.request
+                .borrow()
+                .as_ref()
+                .and_then(|request| request.mode),
+        )
+    }
+
     fn settle(&self, chosen: OutputInfo) -> OutputInfo {
         let request = self.request.borrow();
         let chosen = super::settle_vdd_mode(chosen, request.as_ref().and_then(|r| r.mode), || {});
@@ -1731,6 +1756,7 @@ mod tests {
         on_sleep: &'a dyn Fn(Duration),
         enable_fails: Option<EnableReport>,
         calls: RefCell<Vec<Call>>,
+        attach_requests: Cell<usize>,
     }
 
     impl<'a> FakeDriver<'a> {
@@ -1750,6 +1776,7 @@ mod tests {
                 on_sleep,
                 enable_fails: None,
                 calls: RefCell::new(Vec::new()),
+                attach_requests: Cell::new(0),
             }
         }
 
@@ -1759,6 +1786,11 @@ mod tests {
     }
 
     impl Driver for FakeDriver<'_> {
+        fn attach_inactive(&self) -> bool {
+            self.attach_requests.set(self.attach_requests.get() + 1);
+            true
+        }
+
         fn outputs(&self) -> Vec<OutputInfo> {
             let mut outputs = vec![output("primary", true)];
             let attached = self
@@ -1827,6 +1859,17 @@ mod tests {
                 (self.on_sleep)(self.elapsed.get());
             }
         }
+    }
+
+    #[test]
+    fn inactive_display_is_requested_once_while_mirroring() {
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        let driver = FakeDriver::new(Duration::ZERO, None, &|_| {});
+        attach(&shared, &driver, Duration::from_secs(4));
+        assert_eq!(driver.attach_requests.get(), 1);
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        assert!(driver.calls().contains(&Call::Disable));
     }
 
     /// A 0.3.2 log and the 0.3.1 field data: the display never attaches,

@@ -219,6 +219,156 @@ pub fn query() -> DeviceState {
     DeviceState::best(states)
 }
 
+/// Add exactly one available inactive VDD target to the existing desktop.
+/// Keep every active path and mode, and refuse ambiguous virtual targets or
+/// paths that would clone an existing source. Windows validates before apply.
+#[cfg(windows)]
+pub fn attach_inactive_display(requested: Option<crate::vdd_settings::VddMode>) -> bool {
+    use windows::Win32::Devices::Display::{
+        SetDisplayConfig, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_0,
+        DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PIXELFORMAT_32BPP,
+        DISPLAYCONFIG_SOURCE_MODE, QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES,
+        SDC_APPLY, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG, SDC_VALIDATE,
+    };
+    use windows::Win32::Foundation::POINTL;
+    let Some((mut active, mut modes)) = crate::vdd_snapshot::display_config(QDC_ONLY_ACTIVE_PATHS)
+    else {
+        return false;
+    };
+    if active.is_empty() {
+        return false;
+    }
+    let Some((all, _)) = crate::vdd_snapshot::display_config(QDC_ALL_PATHS) else {
+        return false;
+    };
+    let available_targets: std::collections::HashSet<_> = all
+        .iter()
+        .filter(|p| p.targetInfo.targetAvailable.as_bool())
+        .map(|p| {
+            (
+                crate::vdd_snapshot::luid_value(p.targetInfo.adapterId),
+                p.targetInfo.id,
+            )
+        })
+        .collect();
+    let safe_to_extend_topology = active.len() == 1 && available_targets.len() == 2;
+    let virtual_paths: Vec<_> = all
+        .into_iter()
+        .filter(|path| {
+            path.targetInfo.targetAvailable.as_bool()
+                && crate::vdd_snapshot::is_vdd_monitor(&crate::vdd_snapshot::monitor_path(path))
+        })
+        .collect();
+    let targets: std::collections::HashSet<_> = virtual_paths
+        .iter()
+        .map(|p| {
+            (
+                crate::vdd_snapshot::luid_value(p.targetInfo.adapterId),
+                p.targetInfo.id,
+            )
+        })
+        .collect();
+    if targets.len() != 1
+        || active
+            .iter()
+            .any(|p| crate::vdd_snapshot::is_vdd_monitor(&crate::vdd_snapshot::monitor_path(p)))
+    {
+        return false;
+    }
+    let Some(mut candidate) = virtual_paths.into_iter().find(|p| {
+        !active.iter().any(|a| {
+            crate::vdd_snapshot::luid_value(a.sourceInfo.adapterId)
+                == crate::vdd_snapshot::luid_value(p.sourceInfo.adapterId)
+                && a.sourceInfo.id == p.sourceInfo.id
+        })
+    }) else {
+        return false;
+    };
+    // DISPLAYCONFIG_PATH_ACTIVE
+    candidate.flags |= 1;
+    // Supply an explicit position: an unspecified source mode can be accepted
+    // by Windows without adding a second desktop surface.
+    let right = modes
+        .iter()
+        .filter(|m| m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+        .map(|m| {
+            let source = unsafe { m.Anonymous.sourceMode };
+            source.position.x.saturating_add(source.width as i32)
+        })
+        .max()
+        .unwrap_or(0);
+    let requested = requested.unwrap_or(crate::vdd_settings::VddMode {
+        width: 1920,
+        height: 1080,
+        refresh_hz: 60,
+    });
+    candidate.sourceInfo.Anonymous.modeInfoIdx = modes.len() as u32;
+    candidate.targetInfo.Anonymous.modeInfoIdx = u32::MAX;
+    modes.push(DISPLAYCONFIG_MODE_INFO {
+        infoType: DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+        id: candidate.sourceInfo.id,
+        adapterId: candidate.sourceInfo.adapterId,
+        Anonymous: DISPLAYCONFIG_MODE_INFO_0 {
+            sourceMode: DISPLAYCONFIG_SOURCE_MODE {
+                width: requested.width,
+                height: requested.height,
+                pixelFormat: DISPLAYCONFIG_PIXELFORMAT_32BPP,
+                position: POINTL { x: right, y: 0 },
+            },
+        },
+    });
+    active.push(candidate);
+    let flags = SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES;
+    let valid = unsafe { SetDisplayConfig(Some(&active), Some(&modes), flags | SDC_VALIDATE) };
+    if valid != 0 {
+        tracing::warn!(
+            code = valid,
+            "Windows rejected the virtual display topology"
+        );
+        return false;
+    }
+    let result = unsafe { SetDisplayConfig(Some(&active), Some(&modes), flags | SDC_APPLY) };
+    if result != 0 {
+        tracing::warn!(
+            code = result,
+            "Windows could not attach the virtual display"
+        );
+        return false;
+    }
+    let mut attached =
+        crate::vdd_snapshot::display_config(QDC_ONLY_ACTIVE_PATHS).is_some_and(|(paths, _)| {
+            paths
+                .iter()
+                .any(|p| crate::vdd_snapshot::is_vdd_monitor(&crate::vdd_snapshot::monitor_path(p)))
+        });
+    if !attached && safe_to_extend_topology {
+        // With exactly one real display and this one VDD target, the system's
+        // extend topology cannot bring unrelated monitors into the desktop.
+        let result = unsafe { SetDisplayConfig(None, None, SDC_TOPOLOGY_EXTEND | SDC_APPLY) };
+        tracing::info!(code = result, "Requested Windows extended topology");
+        if result == 0 {
+            attached = crate::vdd_snapshot::display_config(QDC_ONLY_ACTIVE_PATHS).is_some_and(
+                |(paths, _)| {
+                    paths.iter().any(|p| {
+                        crate::vdd_snapshot::is_vdd_monitor(&crate::vdd_snapshot::monitor_path(p))
+                    })
+                },
+            );
+        }
+    }
+    if attached {
+        tracing::info!("Windows attached the virtual display to the desktop");
+    } else {
+        tracing::warn!(
+            "Windows accepted the display request but left the virtual display inactive"
+        );
+    }
+    // The request was accepted even if the target has not appeared yet.
+    // The caller waits for a real output; avoid repeatedly changing the
+    // desktop while Windows is still applying the topology.
+    true
+}
+
 /// Set the mode of the virtual display `device` (a GDI name like
 /// `\\.\DISPLAY5`), and save it for this set of displays. Only that
 /// display changes. Tried with the refresh rate first, then without it.
