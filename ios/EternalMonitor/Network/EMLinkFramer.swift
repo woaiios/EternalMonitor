@@ -4,7 +4,7 @@ import Foundation
 /// datagram, regardless of how TCP divides or combines the incoming bytes.
 struct EMLinkFramer {
     static let preamble = Data([0x45, 0x4D, 0x4C, 0x49, 0x4E, 0x4B, 1, 0])
-    static let maximumLength = 1400
+    static let maximumLength = 16 * 1024
 
     enum FramingError: Error, Equatable {
         case invalidPreamble

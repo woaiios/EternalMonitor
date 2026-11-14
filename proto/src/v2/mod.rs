@@ -32,6 +32,10 @@ pub const VERSION: u8 = 2;
 pub const PREFIX_SIZE: usize = 8;
 /// Maximum size of any datagram we send (matches v1's conservative WiFi MTU pick).
 pub const MAX_DGRAM_SIZE: usize = 1400;
+/// A USB tunnel is a reliable byte stream with a 2-byte length prefix, not a
+/// WiFi MTU. Larger media datagrams cut the per-frame fragment count (and the
+/// iPad's reassembly work) by an order of magnitude. UDP keeps MAX_DGRAM_SIZE.
+pub const USB_MAX_DGRAM_SIZE: usize = 16 * 1024;
 
 /// First bytes of the legacy v1 hello ("ETERNALHELLO"). Kept here so the host can
 /// recognize old clients and surface a "please update" message instead of silence.

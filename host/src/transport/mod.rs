@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use eternal_wire::v2::media::{
     media_payload_size, MediaHeader, MAX_FRAG_COUNT, MAX_MEDIA_PAYLOAD, MEDIA_HEADER_SIZE,
 };
-use eternal_wire::v2::{classify, Classified, MAX_DGRAM_SIZE};
+use eternal_wire::v2::{classify, Classified, USB_MAX_DGRAM_SIZE};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -289,7 +289,7 @@ pub async fn start_sender(
     let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
     shared.session.lock().transport_resumed(now());
     let mut deferred_control = VecDeque::new();
-    let mut dgram_scratch = [0u8; MAX_DGRAM_SIZE];
+    let mut dgram_scratch = vec![0u8; USB_MAX_DGRAM_SIZE];
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut liveness_tick = tokio::time::interval(Duration::from_millis(250));
@@ -429,7 +429,16 @@ pub async fn start_sender(
                 frame_seq = frame_seq.wrapping_add(1);
                 let send_start = Instant::now();
                 let payload = &nal.data;
-                let payload_size = media_payload_size(shared.max_dgram.load(Ordering::SeqCst) as usize).unwrap_or(MAX_MEDIA_PAYLOAD);
+                let payload_size = if target_addr.link == LinkId::Udp {
+                    media_payload_size(shared.max_dgram.load(Ordering::SeqCst) as usize)
+                        .unwrap_or(MAX_MEDIA_PAYLOAD)
+                } else {
+                    std::env::var("ETERNAL_USB_PAYLOAD")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|v| (544..=USB_MAX_DGRAM_SIZE - MEDIA_HEADER_SIZE).contains(v))
+                        .unwrap_or(USB_MAX_DGRAM_SIZE - MEDIA_HEADER_SIZE)
+                };
                 let frag_count_usize = payload.len().div_ceil(payload_size).max(1);
                 if frag_count_usize > usize::from(MAX_FRAG_COUNT) {
                     warn!(

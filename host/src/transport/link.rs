@@ -12,7 +12,7 @@ use tokio::time::Instant;
 
 use eternal_wire::v2::audio::{AudioHeader, AUDIO_FLAG_DISCONTINUITY};
 use eternal_wire::v2::media::MediaHeader;
-use eternal_wire::v2::{classify, Classified, MAX_DGRAM_SIZE};
+use eternal_wire::v2::{classify, Classified, USB_MAX_DGRAM_SIZE};
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -23,8 +23,8 @@ pub const PREAMBLE: &[u8; 8] = b"EMLINK\x01\x00";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Room for a keyframe burst to drain: about 100 ms at 60 fps. Two frames
 /// overflowed behind every keyframe on a slow PC's usbmuxd.
-const FRAME_LIMIT: usize = 6;
-const BYTE_LIMIT: usize = 1024 * 1024;
+const FRAME_LIMIT: usize = 12;
+const BYTE_LIMIT: usize = 8 * 1024 * 1024;
 const KEYFRAME_BACKOFF_MIN: Duration = Duration::from_millis(250);
 const KEYFRAME_BACKOFF_MAX: Duration = Duration::from_secs(2);
 /// This long without a lost frame, and the next request is immediate again.
@@ -115,7 +115,7 @@ fn invalid(message: &'static str) -> io::Error {
 }
 
 fn check_length(len: usize) -> io::Result<()> {
-    if !(1..=MAX_DGRAM_SIZE).contains(&len) {
+    if !(1..=USB_MAX_DGRAM_SIZE).contains(&len) {
         return Err(invalid("EMLINK packet length"));
     }
     Ok(())
@@ -145,10 +145,10 @@ pub async fn write_datagram(
     bytes: &[u8],
 ) -> io::Result<()> {
     check_length(bytes.len())?;
-    let mut framed = [0; MAX_DGRAM_SIZE + 2];
-    framed[..2].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
-    framed[2..2 + bytes.len()].copy_from_slice(bytes);
-    writer.write_all(&framed[..2 + bytes.len()]).await
+    let mut framed = Vec::with_capacity(bytes.len() + 2);
+    framed.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    framed.extend_from_slice(bytes);
+    writer.write_all(&framed).await
 }
 
 struct Frame {
@@ -666,7 +666,7 @@ async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) ->
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| (1..=64).contains(v))
         .unwrap_or(32);
-    let mut batch = Vec::with_capacity(batch_count * (MAX_DGRAM_SIZE + 2));
+    let mut batch = Vec::with_capacity(batch_count * (USB_MAX_DGRAM_SIZE + 2));
     loop {
         if *closed.borrow() {
             return Ok(());
