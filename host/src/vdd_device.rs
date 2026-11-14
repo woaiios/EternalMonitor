@@ -268,30 +268,55 @@ pub fn attach_inactive_display(requested: Option<crate::vdd_settings::VddMode>) 
             )
         })
         .collect();
-    if targets.len() != 1
-        || active
-            .iter()
-            .any(|p| crate::vdd_snapshot::is_vdd_monitor(&crate::vdd_snapshot::monitor_path(p)))
-    {
-        return false;
+    let active_vdd = active
+        .iter()
+        .position(|p| crate::vdd_snapshot::is_vdd_monitor(&crate::vdd_snapshot::monitor_path(p)));
+    if targets.len() != 1 {
+        // More than one virtual target: don't guess which one to move, just
+        // ask Windows to re-apply the extended topology.
+        let result = unsafe { SetDisplayConfig(None, None, SDC_TOPOLOGY_EXTEND | SDC_APPLY) };
+        tracing::info!(
+            code = result,
+            virtual_targets = targets.len(),
+            "Re-applied Windows extended topology for the virtual display"
+        );
+        return result == 0;
     }
-    let Some(mut candidate) = virtual_paths.into_iter().find(|p| {
-        !active.iter().any(|a| {
-            crate::vdd_snapshot::luid_value(a.sourceInfo.adapterId)
-                == crate::vdd_snapshot::luid_value(p.sourceInfo.adapterId)
-                && a.sourceInfo.id == p.sourceInfo.id
-        })
-    }) else {
-        return false;
+    // Windows may already list the virtual path as active yet never give it
+    // a desktop surface, so DXGI keeps reporting one output. Re-apply that
+    // path with an explicit source mode, the same fix used below for a path
+    // that is still inactive.
+    let was_active = active_vdd.is_some();
+    let mut candidate = if let Some(index) = active_vdd {
+        active.remove(index)
+    } else {
+        let Some(candidate) = virtual_paths.into_iter().find(|p| {
+            !active.iter().any(|a| {
+                crate::vdd_snapshot::luid_value(a.sourceInfo.adapterId)
+                    == crate::vdd_snapshot::luid_value(p.sourceInfo.adapterId)
+                    && a.sourceInfo.id == p.sourceInfo.id
+            })
+        }) else {
+            return false;
+        };
+        candidate
     };
     // DISPLAYCONFIG_PATH_ACTIVE
     candidate.flags |= 1;
+    let vdd_mode_idx = unsafe { candidate.sourceInfo.Anonymous.modeInfoIdx } as usize;
+    let has_vdd_mode = vdd_mode_idx < modes.len()
+        && modes[vdd_mode_idx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE;
     // Supply an explicit position: an unspecified source mode can be accepted
-    // by Windows without adding a second desktop surface.
+    // by Windows without adding a second desktop surface. Reuse the mode slot
+    // Windows already gave this path when there is one.
     let right = modes
         .iter()
-        .filter(|m| m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
-        .map(|m| {
+        .enumerate()
+        .filter(|(i, m)| {
+            m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+                && !(has_vdd_mode && *i == vdd_mode_idx)
+        })
+        .map(|(_, m)| {
             let source = unsafe { m.Anonymous.sourceMode };
             source.position.x.saturating_add(source.width as i32)
         })
@@ -302,9 +327,7 @@ pub fn attach_inactive_display(requested: Option<crate::vdd_settings::VddMode>) 
         height: 1080,
         refresh_hz: 60,
     });
-    candidate.sourceInfo.Anonymous.modeInfoIdx = modes.len() as u32;
-    candidate.targetInfo.Anonymous.modeInfoIdx = u32::MAX;
-    modes.push(DISPLAYCONFIG_MODE_INFO {
+    let source_mode = DISPLAYCONFIG_MODE_INFO {
         infoType: DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
         id: candidate.sourceInfo.id,
         adapterId: candidate.sourceInfo.adapterId,
@@ -316,7 +339,16 @@ pub fn attach_inactive_display(requested: Option<crate::vdd_settings::VddMode>) 
                 position: POINTL { x: right, y: 0 },
             },
         },
-    });
+    };
+    if has_vdd_mode {
+        modes[vdd_mode_idx] = source_mode;
+    } else {
+        candidate.sourceInfo.Anonymous.modeInfoIdx = modes.len() as u32;
+        modes.push(source_mode);
+    }
+    if !was_active {
+        candidate.targetInfo.Anonymous.modeInfoIdx = u32::MAX;
+    }
     active.push(candidate);
     let flags = SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES;
     let valid = unsafe { SetDisplayConfig(Some(&active), Some(&modes), flags | SDC_VALIDATE) };

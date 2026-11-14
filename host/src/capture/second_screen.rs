@@ -1353,13 +1353,21 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
     // with no change to wait for.
     let outputs = driver.outputs();
     let owned = shared.vdd_output.lock().clone();
+    // Match by device name only. On hybrid-GPU PCs Windows can put the
+    // virtual display at (0, 0), so DXGI reports it as primary and the real
+    // monitor as secondary; requiring `!is_primary` here made a pipeline
+    // restart wait for a "new" output that was already attached, then time
+    // out and tear the second screen down.
     if let Some(name) = owned.filter(|name| {
-        outputs
-            .iter()
-            .any(|output| !output.is_primary && &output.device_name == name)
+        outputs.iter().any(|output| &output.device_name == name)
     }) {
-        info!(device = %name, "Virtual display still attached — capturing it");
-        note_attached(shared, name);
+        // A pipeline restart calls attach() again while the display is
+        // already attached and capture has moved onto it. Re-arming the
+        // switch restarts the pipeline forever and starves capture, so
+        // settle the state here instead of asking for another switch.
+        *shared.vdd_status.lock() = VddStatus::Active;
+        shared.second_screen.lock().switch_pending = false;
+        tracing::debug!(device = %name, "Virtual display already captured — no switch");
         return;
     }
     if !wait_for_toggle_gap(shared, driver, &selected) {
@@ -1413,6 +1421,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
     let waiting_since = driver.now();
     let mut next_attach = waiting_since + Duration::from_secs(1);
     let mut attach_requested = false;
+    let mut last_poll: Option<Vec<String>> = None;
     let result = wait_for_virtual_output(
         &before,
         timeout,
@@ -1421,6 +1430,16 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
                 return None;
             }
             let outputs = driver.outputs();
+            let names: Vec<String> = outputs.iter().map(|o| o.device_name.clone()).collect();
+            if last_poll.as_ref() != Some(&names) {
+                tracing::info!(
+                    count = names.len(),
+                    ?names,
+                    before = ?before,
+                    "Display outputs while the virtual display attaches"
+                );
+                last_poll = Some(names);
+            }
             if !attach_requested && driver.now() >= next_attach {
                 attach_requested = driver.attach_inactive();
                 next_attach = driver.now() + Duration::from_secs(2);

@@ -966,9 +966,20 @@ fn run_platform_loop(
 /// real second monitor.
 #[cfg(any(windows, test, debug_assertions))]
 fn pick_new_virtual_output<'a>(before: &[String], now: &'a [OutputInfo]) -> Option<&'a OutputInfo> {
+    let fresh = |o: &&OutputInfo| !before.contains(&o.device_name);
     now.iter()
-        .filter(|o| !o.is_primary)
-        .find(|o| !before.contains(&o.device_name))
+        .find(|o| !o.is_primary && fresh(o))
+        .or_else(|| {
+            // On hybrid-GPU PCs Windows can place the virtual display at
+            // (0, 0), so DXGI reports it as primary too. Accept a fresh
+            // output in that case, but only while a previously known output
+            // is still present: a lone primary is never a virtual display.
+            if now.iter().any(|o| before.contains(&o.device_name)) {
+                now.iter().find(fresh)
+            } else {
+                None
+            }
+        })
 }
 
 #[cfg(test)]
