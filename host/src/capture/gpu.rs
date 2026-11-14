@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Dxgi::{
 static FAILED: AtomicBool = AtomicBool::new(false);
 pub fn requested() -> bool {
     !FAILED.load(Ordering::Relaxed)
-        && std::env::var("ETERNAL_PYROWAVE_GPU_CAPTURE").as_deref() == Ok("1")
+        && crate::encoder::pyrowave::enabled("ETERNAL_PYROWAVE_GPU_CAPTURE")
 }
 pub fn disable() {
     FAILED.store(true, Ordering::Relaxed);

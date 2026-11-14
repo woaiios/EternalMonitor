@@ -1,10 +1,19 @@
-//! USB-only experimental PyroWave encoder. H.264/HEVC remains the fallback.
+//! USB-only PyroWave encoder. H.264/HEVC remains the fallback for Wi-Fi,
+//! older clients, and any runtime failure to load the DLL or its extensions.
 //! The DLL is built from the pinned upstream source and loaded from the app
 //! directory with restricted dependency lookup; it is never downloaded at runtime.
 use crate::capture::RawFrame;
 
-pub(super) fn requested() -> bool {
-    cfg!(windows) && std::env::var("ETERNAL_PYROWAVE").is_ok_and(|value| value == "1")
+/// An opt-out switch: on unless the variable is explicitly set to "0".
+/// PyroWave and the D3D11 shared-texture handoff used to be opt-in experiments
+/// behind `=1`; they are the default USB path now, so a plain launch of the
+/// host cannot silently fall back to H.264. Set `=0` to disable either one.
+pub(crate) fn enabled(name: &str) -> bool {
+    !std::env::var(name).is_ok_and(|value| value.trim() == "0")
+}
+
+pub(crate) fn requested() -> bool {
+    cfg!(windows) && enabled("ETERNAL_PYROWAVE")
 }
 
 pub(crate) fn bitrate_bps() -> u32 {
@@ -17,7 +26,7 @@ pub(crate) fn bitrate_bps() -> u32 {
 }
 
 pub(crate) fn output_dimensions(width: u32, height: u32) -> (u32, u32) {
-    if std::env::var("ETERNAL_PYROWAVE_BGRA").as_deref() != Ok("1") {
+    if !enabled("ETERNAL_PYROWAVE_BGRA") {
         return (width, height);
     }
     let target = std::env::var("ETERNAL_PYROWAVE_HEIGHT")
@@ -454,7 +463,7 @@ mod native {
             let (input_width, input_height) = (width, height);
             let (width, height) = output_dimensions(width, height);
             let api = Api::load()?;
-            let gpu_convert = std::env::var("ETERNAL_PYROWAVE_BGRA").as_deref() == Ok("1");
+            let gpu_convert = enabled("ETERNAL_PYROWAVE_BGRA");
             if gpu_convert && api.encode_bgra.is_none() {
                 return Err("PyroWave DLL lacks the optional BGRA extension".into());
             }
@@ -513,12 +522,12 @@ mod native {
                     ),
                     "device create",
                 )?;
-                let queue_type =
-                    if std::env::var("ETERNAL_PYROWAVE_QUEUE").as_deref() == Ok("graphics") {
-                        1
-                    } else {
-                        2
-                    };
+                // The graphics queue is the shared-texture profile's default;
+                // set =compute for the older async compute queue.
+                let queue_type = match std::env::var("ETERNAL_PYROWAVE_QUEUE").as_deref() {
+                    Ok("compute") => 2,
+                    _ => 1,
+                };
                 checked(
                     (state.api.queue)(state.device, queue_type),
                     "async compute queue selection",

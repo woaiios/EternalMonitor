@@ -120,7 +120,7 @@ WDA 按用户要求保持停止，8100 转发也已停止。旧 WDA 曾启动失
 ## 代码入口与协议
 
 - `host/src/encoder/pyrowave.rs`：动态加载 exe 旁的 `libpyrowave-shared-1.dll`，检查 C API 主版本 1；指定 AMD/NVIDIA vendor，异步 compute 队列，CPU YUV420 上传、编码、packetize。
-- `host/src/encoder/mod.rs`：仅 `ETERNAL_PYROWAVE=1` + USB + 新客户端能力位才选 PyroWave。DLL/驱动/编码失败后在当前 pipeline generation 回退 H.264/HEVC；离开 PyroWave 重开常规编码器并要求 IDR。Wi-Fi/旧客户端继续使用已有编码。
+- `host/src/encoder/mod.rs`：USB + 新客户端能力位即选 PyroWave。2026-11-14 起 PyroWave 与 D3D11 共享纹理采集为默认开启（`ETERNAL_PYROWAVE=0` / `ETERNAL_PYROWAVE_GPU_CAPTURE=0` 才关闭），避免裸启动 exe 静默退回 H.264；BGRA 转换与 graphics queue 同样默认开启。DLL/驱动/编码失败后在当前 pipeline generation 回退 H.264/HEVC；离开 PyroWave 重开常规编码器并要求 IDR。Wi-Fi/旧客户端继续使用已有编码。
 - `ETERNAL_PYROWAVE_GPU=amd|nvidia|auto`，未设置该变量时使用 auto；启动脚本默认 amd。`ETERNAL_PYROWAVE_MBPS` 100–1000，默认 350（码率上限，不是保证实际占满）。
 - `proto/src/v2/control.rs` / iOS `WireProtocol.swift`：codec 2、decoder cap `1<<3`。媒体分片与 USB 长度封装沿用旧协议。
 - EPW1 access unit：小端 `magic[4]="EPW1", width:u16, height:u16, flags:u32=1, packet_count:u32`，后接多组 `packet_length:u32 + upstream packet`。flags 1 表示 SDR YUV420 video-range，每帧独立。

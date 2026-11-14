@@ -451,7 +451,7 @@ pub fn run_capture_loop(
                     continue;
                 }
                 let gpu_client = super::gpu::requested()
-                    && std::env::var("ETERNAL_PYROWAVE").as_deref() == Ok("1")
+                    && crate::encoder::pyrowave::requested()
                     && {
                         let session = shared.session.lock();
                         session.peer().is_some_and(|peer| {
