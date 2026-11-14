@@ -15,11 +15,6 @@ enum FrameTrace {
     }()
     static func sampled(_ capture: UInt64) -> Bool { enabled && capture != 0 && capture % 30 == 0 }
     static func start() { if enabled { _ = file } }
-    static func displayPeriod(_ period: Double) {
-        guard enabled, let file else { return }
-        let line = "event=display_period period_ms=\(period * 1000)\n"
-        queue.async { try? file.write(contentsOf: Data(line.utf8)) }
-    }
     static func log(_ event: String, capture: UInt64, fields: String = "") {
         guard sampled(capture), let file else { return }
         let now = ControlChannel.clientNowUs()

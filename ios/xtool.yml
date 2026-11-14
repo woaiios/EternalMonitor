@@ -2,7 +2,7 @@ version: 1
 bundleID: dev.eternalmonitor.PyroWavePreview
 infoPath: xtool-info.plist
 iconPath: EternalMonitor/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png
-skipLSP: true
+skipLSP: false
 resources:
   - EternalMonitor/Resources/Fonts
   - EternalMonitor/Resources/Assets.xcassets/LogoImage.imageset/LogoImage.png
